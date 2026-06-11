@@ -111,7 +111,8 @@ async def handle_poll(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     correct_letter = chr(65 + correct_idx) if correct_idx is not None else "A"
 
-    imported_by = msg.from_user.user_id if msg.from_user else 0
+            imported_by = msg.from_user.id if msg.from_user else 0
+
     auto_approve = _is_admin(imported_by)
 
     mcq = {
