@@ -81,8 +81,9 @@ def main():
     app.add_handler(CommandHandler("admin", admin_handler))
     app.add_handler(CommandHandler("pending", pending_approval_handler))
 
-    # MCQ Import - polls from channels/groups
+    # MCQ Import - polls (both from groups AND channels)
     app.add_handler(MessageHandler(filters.POLL, handle_poll))
+    app.add_handler(MessageHandler(filters.UpdateType.CHANNEL_POSTS & filters.POLL, handle_poll))
 
     # MCQ Import - text
     app.add_handler(MessageHandler(
@@ -102,6 +103,8 @@ def main():
 
     # Callback queries (inline buttons)
     app.add_handler(CallbackQueryHandler(quiz_callback_handler, pattern=r'^quiz_'))
+    app.add_handler(CallbackQueryHandler(quiz_callback_handler, pattern=r'^my_stats$'))
+    app.add_handler(CallbackQueryHandler(quiz_callback_handler, pattern=r'^leaderboard$'))
     app.add_handler(CallbackQueryHandler(battle_callback_handler, pattern=r'^battle_'))
     app.add_handler(CallbackQueryHandler(revision_callback_handler, pattern=r'^rev_'))
     app.add_handler(CallbackQueryHandler(admin_callback_handler, pattern=r'^adm_'))
