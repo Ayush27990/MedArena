@@ -9,7 +9,6 @@ from config import SUBJECTS, DIFFICULTIES
 async def search_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
     if args:
-        # Direct keyword search: /search keyword
         keyword = " ".join(args)
         await _do_search(update, context, keyword=keyword)
     else:
@@ -21,6 +20,16 @@ async def search_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg = "🔍 *Search MCQ Database*\n\nChoose a filter:"
         if update.message:
             await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=kb)
+
+
+async def handle_search_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Called from bot.py when user is in keyword search mode."""
+    if context.user_data.get("search_mode") == "keyword":
+        keyword = update.message.text.strip()
+        context.user_data.pop("search_mode", None)
+        await _do_search(update, context, keyword=keyword)
+        return True
+    return False
 
 
 async def _do_search(update, context, keyword=None, subject=None, difficulty=None):
@@ -51,10 +60,18 @@ async def _do_search(update, context, keyword=None, subject=None, difficulty=Non
         if mcq.get("option_e"):
             opts.append(f"E. {mcq['option_e']}")
 
+        # FIX: Use plain "Answer: X" instead of broken ||spoiler|| syntax
+        correct_letter = mcq['correct']
+        correct_opts = {"A": mcq['option_a'], "B": mcq['option_b'],
+                        "C": mcq['option_c'], "D": mcq['option_d']}
+        if mcq.get("option_e"):
+            correct_opts["E"] = mcq['option_e']
+        correct_text = correct_opts.get(correct_letter, "")
+
         text = (
             f"❓ {q}\n\n"
             + "\n".join(opts) +
-            f"\n\n||✅ Answer: *{mcq['correct']}*||\n"
+            f"\n\n✅ Answer: *{correct_letter}* — {correct_text}\n"
             f"📚 {mcq.get('subject') or '?'} | 🎯 {mcq.get('difficulty') or '?'}"
         )
 
