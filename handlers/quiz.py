@@ -355,8 +355,15 @@ async def _handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE, cho
     result_text = f"{icon} *{'Correct!' if is_correct else 'Wrong!'}*\n\n"
     result_text += f"Your answer: *{chosen}*\n"
     result_text += f"Correct: *{correct}* — {correct_text}\n"
+
+    # FIX: Use full explanation (up to Telegram's 4096 char limit), not 300
     if explanation:
-        result_text += f"\n📖 {explanation[:300]}\n"
+        # Reserve ~200 chars for the header and XP line
+        max_exp_len = 3800
+        if len(explanation) > max_exp_len:
+            explanation = explanation[:max_exp_len] + "…"
+        result_text += f"\n📖 {explanation}\n"
+
     result_text += f"\n⚡ XP: {'+' if xp_gain >= 0 else ''}{xp_gain}"
 
     next_index = q_index + 1
