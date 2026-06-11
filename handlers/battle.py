@@ -31,21 +31,32 @@ async def battle_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
 
     if not args:
-        await update.message.reply_text(
+        help_text = (
             "⚔️ *Battle Mode*\n\n"
             "Challenge someone:\n"
             "`/battle @username` — in a group\n"
             "`/battle` — in a group (anyone can accept)\n\n"
-            "Both players get the same questions\\. Faster correct answers = bonus XP\\!",
-            parse_mode="MarkdownV2"
+            "Both players get the same questions\\. Faster correct answers = bonus XP\\!"
         )
+        if update.callback_query:
+            await update.callback_query.edit_message_text(
+                help_text, parse_mode="MarkdownV2"
+            )
+        else:
+            await update.message.reply_text(
+                help_text, parse_mode="MarkdownV2"
+            )
         return
 
     battle_id = f"btl_{uuid.uuid4().hex[:8]}"
     mcqs = await get_mcqs_for_quiz(limit=10)
 
     if not mcqs:
-        await update.message.reply_text("❌ Not enough MCQs in the database yet.")
+        msg = "❌ Not enough MCQs in the database yet."
+        if update.callback_query:
+            await update.callback_query.edit_message_text(msg)
+        else:
+            await update.message.reply_text(msg)
         return
 
     question_ids = [m["id"] for m in mcqs]
@@ -72,16 +83,23 @@ async def battle_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     ]])
 
-    await update.message.reply_text(
+    invite_text = (
         f"⚔️ *{user.first_name}* challenges {mention} to a battle!\n\n"
         f"🔑 Battle ID: `{battle_id}`\n"
         f"❓ Questions: {len(question_ids)}\n"
         f"⏱ {DEFAULT_QUESTION_TIME}s per question\n"
         f"⚡ Speed bonus for fast correct answers!\n\n"
-        f"Accept within {BATTLE_INVITE_TIMEOUT} seconds:",
-        parse_mode="Markdown",
-        reply_markup=kb
+        f"Accept within {BATTLE_INVITE_TIMEOUT} seconds:"
     )
+    if update.callback_query:
+        await update.callback_query.edit_message_text(
+            invite_text, parse_mode="Markdown", reply_markup=kb
+        )
+    else:
+        await update.message.reply_text(
+            invite_text, parse_mode="Markdown", reply_markup=kb
+        )
+
 
 
 async def accept_battle_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):

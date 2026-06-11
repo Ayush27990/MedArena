@@ -27,19 +27,31 @@ _active_timers: dict = {}
 _question_start_times: dict = {}
 
 
+def _escape_md2(text: str) -> str:
+    """Escape all MarkdownV2 reserved characters in plain text."""
+    # Characters that must be escaped in MarkdownV2 outside of entities
+    reserved = r"\_*[]()~`>#+-=|{}.!"
+    for ch in reserved:
+        text = text.replace(ch, f"\\{ch}")
+    return text
+
+
 def _format_question(mcq, q_num: int, total: int, time_per_q: int) -> tuple[str, InlineKeyboardMarkup]:
     letters = ["A", "B", "C", "D", "E"]
     opts = [mcq["option_a"], mcq["option_b"], mcq["option_c"], mcq["option_d"]]
     if mcq.get("option_e"):
         opts.append(mcq["option_e"])
 
+    subject = _escape_md2(mcq.get("subject", "") or "")
+    question = _escape_md2(mcq["question"])
+
     text = (
         f"❓ *Question {q_num}/{total}*\n"
-        f"⏱ {time_per_q}s | 📖 {mcq.get('subject','') or ''}\n\n"
-        f"{mcq['question']}\n\n"
+        f"⏱ {time_per_q}s \\| 📖 {subject}\n\n"
+        f"{question}\n\n"
     )
     for i, opt in enumerate(opts):
-        text += f"*{letters[i]}\.* {opt}\n"
+        text += f"*{letters[i]}\\.* {_escape_md2(opt)}\n"
 
     keyboard = []
     row = []
@@ -357,11 +369,12 @@ async def _handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
         opts.append(mcq["option_e"])
 
     result_icon = "✅" if is_correct else "❌"
-    correct_text = opts[letters.index(mcq["correct"])]
-    explanation = mcq.get("explanation") or "_No explanation available_"
+    correct_text = _escape_md2(opts[letters.index(mcq["correct"])])
+    raw_explanation = mcq.get("explanation") or "No explanation available"
+    explanation = _escape_md2(raw_explanation)
 
     feedback = (
-        f"{result_icon} *{'Correct!' if is_correct else 'Wrong!'}*\n"
+        f"{result_icon} *{'Correct\\!' if is_correct else 'Wrong\\!'}*\n"
         f"Your answer: *{chosen}*\n"
         f"Correct answer: *{mcq['correct']}* — {correct_text}\n\n"
         f"📖 *Explanation:*\n{explanation}\n\n"
@@ -386,7 +399,7 @@ async def _handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["q_index"] = next_index
 
     await query.edit_message_text(
-        feedback, parse_mode="Markdown", reply_markup=kb
+        feedback, parse_mode="MarkdownV2", reply_markup=kb
     )
 
 
