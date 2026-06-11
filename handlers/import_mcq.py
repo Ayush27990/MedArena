@@ -1,4 +1,4 @@
-"""
+""" 
 MCQ Import Handler
 Handles: Telegram polls, forwarded polls, text MCQs, PDFs, images
 """
