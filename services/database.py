@@ -31,16 +31,16 @@ async def init_db():
                 option_c    TEXT NOT NULL,
                 option_d    TEXT NOT NULL,
                 option_e    TEXT,
-                correct     TEXT NOT NULL,        -- 'A','B','C','D','E'
+                correct     TEXT NOT NULL,
                 explanation TEXT,
                 subject     TEXT,
                 topic       TEXT,
                 difficulty  TEXT,
-                source_type TEXT,                  -- poll/text/pdf/image
+                source_type TEXT,
                 source_chat BIGINT,
                 imported_by BIGINT,
                 approved    BOOLEAN DEFAULT FALSE,
-                hash        TEXT UNIQUE,           -- for dedup
+                hash        TEXT UNIQUE,
                 created_at  TIMESTAMPTZ DEFAULT NOW(),
                 updated_at  TIMESTAMPTZ DEFAULT NOW()
             );
@@ -62,7 +62,7 @@ async def init_db():
                 mcq_id      INT REFERENCES mcqs(id) ON DELETE CASCADE,
                 chosen      TEXT,
                 is_correct  BOOLEAN,
-                time_taken  FLOAT,                 -- seconds
+                time_taken  FLOAT,
                 session_id  TEXT,
                 answered_at TIMESTAMPTZ DEFAULT NOW()
             );
@@ -83,7 +83,7 @@ async def init_db():
                 difficulty  TEXT,
                 num_questions INT DEFAULT 10,
                 time_per_q  INT DEFAULT 30,
-                status      TEXT DEFAULT 'waiting',  -- waiting/active/finished
+                status      TEXT DEFAULT 'waiting',
                 current_q   INT DEFAULT 0,
                 question_ids INT[],
                 participants BIGINT[],
@@ -96,7 +96,7 @@ async def init_db():
                 challenger  BIGINT NOT NULL,
                 opponent    BIGINT NOT NULL,
                 chat_id     BIGINT,
-                status      TEXT DEFAULT 'pending',  -- pending/active/finished
+                status      TEXT DEFAULT 'pending',
                 question_ids INT[],
                 current_q   INT DEFAULT 0,
                 scores      JSONB DEFAULT '{}',
@@ -116,7 +116,6 @@ async def init_db():
 # ─── MCQ helpers ────────────────────────────────────────────────────
 
 async def insert_mcq(data: dict) -> int | None:
-    """Insert MCQ, return id or None if duplicate."""
     pool = await get_pool()
     async with pool.acquire() as conn:
         row = await conn.fetchrow("""
@@ -225,12 +224,22 @@ async def get_mcq_by_id(mcq_id: int):
 async def get_db_stats():
     pool = await get_pool()
     async with pool.acquire() as conn:
-        total   = await conn.fetchval("SELECT COUNT(*) FROM mcqs")
+        total    = await conn.fetchval("SELECT COUNT(*) FROM mcqs")
         approved = await conn.fetchval("SELECT COUNT(*) FROM mcqs WHERE approved=TRUE")
         pending  = await conn.fetchval("SELECT COUNT(*) FROM mcqs WHERE approved=FALSE")
         users    = await conn.fetchval("SELECT COUNT(*) FROM users")
         return {"total": total, "approved": approved,
                 "pending": pending, "users": users}
+
+
+async def update_mcq_explanation_by_hash(hash: str, explanation: str):
+    """Update explanation for an MCQ identified by its hash."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE mcqs SET explanation=$1, updated_at=NOW() WHERE hash=$2",
+            explanation, hash
+        )
 
 
 # ─── User helpers ────────────────────────────────────────────────────
@@ -305,7 +314,6 @@ async def get_wrong_questions(user_id: int, limit=20):
 
 
 async def toggle_bookmark(user_id: int, mcq_id: int) -> bool:
-    """Returns True if bookmarked, False if removed."""
     pool = await get_pool()
     async with pool.acquire() as conn:
         exists = await conn.fetchval(
