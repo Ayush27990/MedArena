@@ -17,6 +17,9 @@ from services.ai_service import (
 
 logger = logging.getLogger(__name__)
 
+# In-memory store: chat_id -> {question, options, correct} waiting for explanation
+_pending_explanation: dict = {}
+
 
 def _make_hash(question: str, option_a: str) -> str:
     """Dedup hash from question + first option."""
@@ -53,12 +56,15 @@ async def _process_mcq_dict(mcq: dict, source_type: str, chat_id: int,
     if correct not in "ABCDE":
         correct = "A"
 
-    explanation = mcq.get("explanation")
+    # Use provided explanation as-is — DO NOT let AI override it
+    explanation = mcq.get("explanation") or ""
 
-    # AI categorization
+    # AI categorization ONLY for subject/topic/difficulty — NOT for answer or explanation
     cat = await categorize_mcq(q, opts)
-    if cat.get("question_fixed"):
-        q = cat["question_fixed"]
+
+    # Only fix question text if there were clear typos, never change the answer
+    # Do NOT use cat["question_fixed"] — it can corrupt the question
+    # Do NOT use cat["explanation"] if we already have one
     if not explanation and cat.get("explanation"):
         explanation = cat["explanation"]
 
@@ -88,16 +94,6 @@ async def _process_mcq_dict(mcq: dict, source_type: str, chat_id: int,
 # ─── Poll Handler ────────────────────────────────────────────────────
 
 async def handle_poll(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Handle Telegram quiz polls — both direct and forwarded.
-
-    KEY FIX: When a poll is forwarded, Telegram still delivers the full
-    poll object (question + options + correct_option_id) in msg.poll.
-    The issue was the chat filter blocking it. Now we allow:
-      - Any private chat (always)
-      - Any monitored group (if SOURCE_CHAT_IDS set)
-      - Any group if SOURCE_CHAT_IDS is empty
-    """
     msg = update.message or update.channel_post
     if not msg:
         return
@@ -105,7 +101,6 @@ async def handle_poll(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = msg.chat_id
     is_private = msg.chat.type == "private"
 
-    # Allow private chats always; groups only if monitored
     if not is_private and not _is_monitored_chat(chat_id):
         return
 
@@ -115,14 +110,10 @@ async def handle_poll(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     question = poll.question.strip()
     options = [o.text.strip() for o in poll.options]
-    correct_idx = poll.correct_option_id   # None for regular (non-quiz) polls
-    explanation = poll.explanation
+    correct_idx = poll.correct_option_id
+    explanation = poll.explanation or ""
 
-    if not question:
-        return
-
-    # Accept polls with 2+ options; pad to 4 if needed
-    if len(options) < 2:
+    if not question or len(options) < 2:
         return
 
     correct_letter = chr(65 + correct_idx) if correct_idx is not None else None
@@ -133,8 +124,15 @@ async def handle_poll(update: Update, context: ContextTypes.DEFAULT_TYPE):
     mcq = {
         "question": question,
         "options": options,
-        "correct": correct_letter or "A",   # AI can fix later if unknown
+        "correct": correct_letter or "A",
         "explanation": explanation,
+    }
+
+    # Store in pending so next text message can update explanation
+    _pending_explanation[chat_id] = {
+        "question": question,
+        "option_a": options[0] if options else "",
+        "hash": _make_hash(question, options[0] if options else ""),
     }
 
     ok = await _process_mcq_dict(mcq, "poll", chat_id, imported_by, auto_approve)
@@ -142,25 +140,59 @@ async def handle_poll(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if is_private:
         if ok:
             status = "✅ Added & approved" if auto_approve else "📥 Added — pending admin review"
-            correct_display = f"Correct: *{correct_letter}*" if correct_letter else "⚠️ No correct answer marked (set manually in /pending)"
+            correct_display = f"Correct: *{correct_letter}*" if correct_letter else "⚠️ No correct answer marked"
             await msg.reply_text(
                 f"{status}\n\n"
                 f"📌 *{question[:80]}*\n"
-                f"{correct_display}",
+                f"{correct_display}\n\n"
+                f"💡 Send the explanation as your next message to update it.",
                 parse_mode="Markdown"
             )
         else:
             await msg.reply_text(
-                f"⚠️ *Duplicate* — this question already exists in the database.\n\n"
+                f"⚠️ *Duplicate* — this question already exists.\n\n"
                 f"📌 _{question[:60]}_",
                 parse_mode="Markdown"
             )
 
 
+# ─── Explanation capture Handler ─────────────────────────────────────
+
+async def handle_explanation_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """
+    Called from handle_text_mcq. If the previous message was a poll,
+    treat this text as the explanation for it. Returns True if handled.
+    """
+    msg = update.message
+    if not msg or not msg.text:
+        return False
+
+    chat_id = msg.chat_id
+    pending = _pending_explanation.get(chat_id)
+    if not pending:
+        return False
+
+    text = msg.text.strip()
+    # If text looks like an explanation (not a new MCQ)
+    if text.startswith(("1.", "Q.", "Question")) or len(text) < 10:
+        return False
+
+    # Update explanation in database by hash
+    try:
+        from services.database import update_mcq_explanation_by_hash
+        await update_mcq_explanation_by_hash(pending["hash"], text)
+        _pending_explanation.pop(chat_id, None)
+        logger.info(f"Updated explanation for question hash {pending['hash']}")
+        return True
+    except Exception as e:
+        logger.error(f"Failed to update explanation: {e}")
+        return False
+
+
 # ─── Text MCQ Handler ────────────────────────────────────────────────
 
 async def handle_text_mcq(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Parse text messages that look like MCQs."""
+    """Parse text messages that look like MCQs, or capture explanation."""
     msg = update.message
     if not msg or not msg.text:
         return
@@ -169,18 +201,23 @@ async def handle_text_mcq(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _is_monitored_chat(chat_id) and msg.chat.type != "private":
         return
 
-    text = msg.text.strip()
     imported_by = msg.from_user.id if msg.from_user else 0
 
-    # Only auto-import in private or if from admin
     if msg.chat.type != "private" and not _is_admin(imported_by):
+        # Try to capture as explanation for previous poll
+        await handle_explanation_text(update, context)
         return
 
+    # First check if this is an explanation for a previous poll
+    if await handle_explanation_text(update, context):
+        return
+
+    text = msg.text.strip()
     await msg.reply_text("🔍 Parsing MCQ(s) from text...")
 
     mcqs = await parse_text_mcq(text)
     if not mcqs:
-        await msg.reply_text("❌ Could not extract any MCQs from this text. Check the format.")
+        await msg.reply_text("❌ Could not extract any MCQs from this text.")
         return
 
     auto_approve = _is_admin(imported_by)
@@ -201,7 +238,6 @@ async def handle_text_mcq(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ─── PDF Handler ────────────────────────────────────────────────────
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Extract MCQs from PDF files."""
     msg = update.message
     if not msg or not msg.document:
         return
@@ -220,19 +256,16 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         file = await context.bot.get_file(doc.file_id)
         pdf_bytes = await file.download_as_bytearray()
 
-        # Extract text from PDF using pypdf
         try:
             import pypdf
             reader = pypdf.PdfReader(io.BytesIO(bytes(pdf_bytes)))
-            text = "\n".join(
-                page.extract_text() or "" for page in reader.pages
-            )
+            text = "\n".join(page.extract_text() or "" for page in reader.pages)
         except ImportError:
-            await processing_msg.edit_text("❌ PDF library not installed. Run: pip install pypdf")
+            await processing_msg.edit_text("❌ PDF library not installed.")
             return
 
         if not text.strip():
-            await processing_msg.edit_text("❌ Could not extract text from this PDF (may be scanned).")
+            await processing_msg.edit_text("❌ Could not extract text from this PDF.")
             return
 
         mcqs = await parse_pdf_text(text)
@@ -256,13 +289,12 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     except Exception as e:
         logger.error(f"PDF processing error: {e}")
-        await processing_msg.edit_text("❌ Error processing PDF. Please try again.")
+        await processing_msg.edit_text("❌ Error processing PDF.")
 
 
 # ─── Image/OCR Handler ────────────────────────────────────────────────
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """OCR image to extract MCQs."""
     msg = update.message
     if not msg or not msg.photo:
         return
@@ -274,7 +306,6 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     processing_msg = await msg.reply_text("🔎 Running OCR on image...")
 
     try:
-        # Get highest resolution photo
         photo = msg.photo[-1]
         file = await context.bot.get_file(photo.file_id)
         img_bytes = await file.download_as_bytearray()
@@ -282,10 +313,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         mcqs = await ocr_image_to_mcqs(img_b64)
         if not mcqs:
-            await processing_msg.edit_text(
-                "❌ No MCQs detected in this image.\n"
-                "Tip: Make sure the image is clear and the text is readable."
-            )
+            await processing_msg.edit_text("❌ No MCQs detected in this image.")
             return
 
         auto_approve = _is_admin(imported_by)
