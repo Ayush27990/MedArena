@@ -47,7 +47,10 @@ async def battle_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _start_battle_setup(update, context, mode="dm")
     except Exception as e:
         logger.error(f"battle_handler error: {e}", exc_info=True)
-        await update.message.reply_text(f"❌ Error: {e}")
+        if update.callback_query:
+            await update.callback_query.edit_message_text(f"❌ Error: {e}")
+        else:
+            await update.message.reply_text(f"❌ Error: {e}")
 
 
 async def group_battle_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -56,7 +59,10 @@ async def group_battle_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         await _start_battle_setup(update, context, mode="group")
     except Exception as e:
         logger.error(f"group_battle_handler error: {e}", exc_info=True)
-        await update.message.reply_text(f"❌ Error: {e}")
+        if update.callback_query:
+            await update.callback_query.edit_message_text(f"❌ Error: {e}")
+        else:
+            await update.message.reply_text(f"❌ Error: {e}")
 
 
 async def _start_battle_setup(update, context, mode):
@@ -79,13 +85,16 @@ async def _start_battle_setup(update, context, mode):
                 callback_data=f"bmode_{mode}"
             )
         ]])
-        await update.message.reply_text(
+        text = (
             f"⚔️ *{mode_label}*\n\n"
             f"{mode_desc}\n\n"
             f"Usage: `/{('battle' if mode == 'dm' else 'groupbattle')} @username`\n\n"
-            f"Example: `/{('battle' if mode == 'dm' else 'groupbattle')} @Ayush27990`",
-            parse_mode="Markdown"
+            f"Example: `/{('battle' if mode == 'dm' else 'groupbattle')} @Ayush27990`"
         )
+        if update.callback_query:
+            await update.callback_query.edit_message_text(text, parse_mode="Markdown")
+        else:
+            await update.message.reply_text(text, parse_mode="Markdown")
         return
 
     target_username = args[0].lstrip("@")
@@ -102,13 +111,22 @@ async def _start_battle_setup(update, context, mode):
         for t in TIMER_OPTIONS
     ]])
 
-    await update.message.reply_text(
-        f"⚔️ *{mode_label}*\n\n"
-        f"Challenging: @{target_username}\n\n"
-        f"⏱ Choose seconds per question:",
-        parse_mode="Markdown",
-        reply_markup=kb
-    )
+    if update.callback_query:
+        await update.callback_query.edit_message_text(
+            f"⚔️ *{mode_label}*\n\n"
+            f"Challenging: @{target_username}\n\n"
+            f"⏱ Choose seconds per question:",
+            parse_mode="Markdown",
+            reply_markup=kb
+        )
+    else:
+        await update.message.reply_text(
+            f"⚔️ *{mode_label}*\n\n"
+            f"Challenging: @{target_username}\n\n"
+            f"⏱ Choose seconds per question:",
+            parse_mode="Markdown",
+            reply_markup=kb
+        )
 
 
 # ─── Timer selection callback ─────────────────────────────────────────
