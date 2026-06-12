@@ -51,8 +51,12 @@ async def _process_mcq_dict(mcq: dict, source_type: str, chat_id: int,
     option_a, option_b, option_c, option_d = opts[0], opts[1], opts[2], opts[3]
     option_e = opts[4] if len(opts) > 4 else None
 
-    correct_raw = mcq.get("correct") or "A"
-    correct = str(correct_raw).upper()[:1]
+    # ✅ FIX: Never fall back to "A" if a correct answer is already provided
+    correct_raw = mcq.get("correct")
+    if correct_raw is not None:
+        correct = str(correct_raw).upper()[:1]
+    else:
+        correct = "A"
     if correct not in "ABCDE":
         correct = "A"
 
@@ -116,7 +120,11 @@ async def handle_poll(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not question or len(options) < 2:
         return
 
-    correct_letter = chr(65 + correct_idx) if correct_idx is not None else None
+    # ✅ FIX: Safely convert index to letter — correct_idx=0 is valid (option A)
+    if correct_idx is not None:
+        correct_letter = chr(65 + correct_idx)
+    else:
+        correct_letter = None
 
     imported_by = msg.from_user.id if msg.from_user else 0
     auto_approve = _is_admin(imported_by)
@@ -124,7 +132,8 @@ async def handle_poll(update: Update, context: ContextTypes.DEFAULT_TYPE):
     mcq = {
         "question": question,
         "options": options,
-        "correct": correct_letter or "A",
+        # ✅ FIX: Only fall back to "A" if truly no correct answer was provided
+        "correct": correct_letter if correct_letter is not None else "A",
         "explanation": explanation,
     }
 
