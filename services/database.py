@@ -411,3 +411,13 @@ async def update_battle(battle_id: str, **kwargs):
             f"UPDATE battle_sessions SET {sets} WHERE battle_id=$1",
             battle_id, *vals
         )
+
+
+async def get_user_by_username(username: str):
+    """Find a user by their Telegram username."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        return await conn.fetchrow(
+            "SELECT * FROM users WHERE LOWER(username) = LOWER($1)",
+            username.lstrip("@")
+        )
