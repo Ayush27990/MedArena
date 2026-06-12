@@ -24,10 +24,11 @@ from handlers.admin import (
     admin_handler, admin_callback_handler, handle_admin_search, pending_approval_handler
 )
 from handlers.search import search_handler, search_callback_handler, handle_search_text
+from handlers.import_mcq import handle_explanation_text
 from services.database import init_db
 
 logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)tz",
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
@@ -39,10 +40,16 @@ async def post_init(application: Application) -> None:
 
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Routes text to search keyword handler first, then admin."""
+    """Routes text: explanation capture → search → admin."""
+    # 1. Check if this is an explanation for a previous poll
+    handled = await handle_explanation_text(update, context)
+    if handled:
+        return
+    # 2. Check search keywords
     handled = await handle_search_text(update, context)
     if handled:
         return
+    # 3. Fall through to admin
     await handle_admin_search(update, context)
 
 
@@ -63,7 +70,7 @@ def main():
     app.add_handler(CommandHandler("startquiz", start_group_quiz))
     app.add_handler(CommandHandler("joingame", join_quiz_handler))
 
-    # Battle — DM mode and Group mode
+    # Battle
     app.add_handler(CommandHandler("battle", battle_handler))
     app.add_handler(CommandHandler("groupbattle", group_battle_handler))
 
@@ -93,7 +100,7 @@ def main():
     app.add_handler(MessageHandler(filters.Document.PDF, handle_document))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
 
-    # Text handler (search keywords + admin)
+    # Text handler (explanation → search → admin)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
     # Callback queries
