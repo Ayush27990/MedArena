@@ -1,9 +1,5 @@
 """
 Battle Mode Handler — 1v1 real-time MCQ battles
-Supports:
-  - /battle @user     → DM mode (private questions)
-  - /groupbattle @user → Group mode (questions in group chat with countdown)
-Both support manual timer selection before starting.
 """
 
 import json
@@ -15,7 +11,7 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
 from services.database import (
     get_mcqs_for_quiz, create_battle, get_battle, update_battle,
-    get_mcq_by_id, record_answer, add_xp
+    get_mcq_by_id, record_answer, add_xp, get_user_by_username
 )
 from config import (
     BATTLE_INVITE_TIMEOUT, XP_CORRECT,
@@ -39,16 +35,15 @@ def _parse_ans_cb(data):
     return letter, int(mcq_id), battle_id, int(q_index)
 
 
-# ─── Entry points ────────────────────────────────────────────────────
-
 async def battle_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/battle — DM mode"""
     try:
         await _start_battle_setup(update, context, mode="dm")
     except Exception as e:
         logger.error(f"battle_handler error: {e}", exc_info=True)
-        if update.callback_query:
-            await update.callback_query.edit_message_text(f"❌ Error: {e}")
+        msg = update.callback_query or update.message
+        if hasattr(msg, 'edit_message_text'):
+            await msg.edit_message_text(f"❌ Error: {e}")
         else:
             await update.message.reply_text(f"❌ Error: {e}")
 
@@ -59,48 +54,40 @@ async def group_battle_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         await _start_battle_setup(update, context, mode="group")
     except Exception as e:
         logger.error(f"group_battle_handler error: {e}", exc_info=True)
-        if update.callback_query:
-            await update.callback_query.edit_message_text(f"❌ Error: {e}")
-        else:
-            await update.message.reply_text(f"❌ Error: {e}")
+        await update.message.reply_text(f"❌ Error: {e}")
 
 
 async def _start_battle_setup(update, context, mode):
     user = update.effective_user
-    # Support both "/battle @user" and "/battle@BotName @user"
     args = context.args or []
-    # Filter out any bot mention that might end up in args
-    args = [a for a in args if not a.startswith("@") or len(a) > 1]
 
     mode_label = "DM Battle 🔒" if mode == "dm" else "Group Battle 👥"
-    mode_desc = (
-        "Questions sent privately to each player." if mode == "dm"
-        else "Questions appear in this group chat."
-    )
 
     if not args:
-        kb = InlineKeyboardMarkup([[
-            InlineKeyboardButton(
-                f"{'⚔️ DM Battle' if mode == 'dm' else '👥 Group Battle'}",
-                callback_data=f"bmode_{mode}"
-            )
-        ]])
         text = (
             f"⚔️ *{mode_label}*\n\n"
-            f"{mode_desc}\n\n"
             f"Usage: `/{('battle' if mode == 'dm' else 'groupbattle')} @username`\n\n"
-            f"Example: `/{('battle' if mode == 'dm' else 'groupbattle')} @Ayush27990`"
+            f"Example: `/battle @Ayush27990`"
         )
-        if update.callback_query:
-            await update.callback_query.edit_message_text(text, parse_mode="Markdown")
-        else:
-            await update.message.reply_text(text, parse_mode="Markdown")
+        await update.message.reply_text(text, parse_mode="Markdown")
         return
 
     target_username = args[0].lstrip("@")
+
+    # Look up opponent in database by username
+    opponent_user = await get_user_by_username(target_username)
+    if not opponent_user:
+        await update.message.reply_text(
+            f"❌ @{target_username} hasn't started the bot yet.\n\n"
+            f"Ask them to open @MedArena121_bot and send /start first!",
+            parse_mode="Markdown"
+        )
+        return
+
     context.user_data["battle_setup"] = {
         "mode": mode,
         "target": target_username,
+        "target_id": opponent_user["user_id"],
         "chat_id": update.effective_chat.id,
         "challenger_id": user.id,
         "challenger_name": user.first_name or "Challenger",
@@ -111,25 +98,14 @@ async def _start_battle_setup(update, context, mode):
         for t in TIMER_OPTIONS
     ]])
 
-    if update.callback_query:
-        await update.callback_query.edit_message_text(
-            f"⚔️ *{mode_label}*\n\n"
-            f"Challenging: @{target_username}\n\n"
-            f"⏱ Choose seconds per question:",
-            parse_mode="Markdown",
-            reply_markup=kb
-        )
-    else:
-        await update.message.reply_text(
-            f"⚔️ *{mode_label}*\n\n"
-            f"Challenging: @{target_username}\n\n"
-            f"⏱ Choose seconds per question:",
-            parse_mode="Markdown",
-            reply_markup=kb
-        )
+    await update.message.reply_text(
+        f"⚔️ *{mode_label}*\n\n"
+        f"Challenging: @{target_username}\n\n"
+        f"⏱ Choose seconds per question:",
+        parse_mode="Markdown",
+        reply_markup=kb
+    )
 
-
-# ─── Timer selection callback ─────────────────────────────────────────
 
 async def battle_setup_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -146,6 +122,7 @@ async def battle_setup_callback(update: Update, context: ContextTypes.DEFAULT_TY
 
         mode = setup["mode"]
         target = setup["target"]
+        target_id = setup["target_id"]
         chat_id = setup["chat_id"]
         challenger_name = setup["challenger_name"]
 
@@ -175,26 +152,39 @@ async def battle_setup_callback(update: Update, context: ContextTypes.DEFAULT_TY
         context.user_data.pop("battle_setup", None)
 
         mode_tag = "🔒 DM mode — questions sent privately" if mode == "dm" \
-                   else "👥 Group mode — questions appear here"
+                   else "👥 Group mode"
         kb = InlineKeyboardMarkup([[
             InlineKeyboardButton("⚔️ Accept Battle!", callback_data=f"accept_battle_{battle_id}")
         ]])
 
-        await query.edit_message_text(
+        invite_text = (
             f"⚔️ *{challenger_name}* challenges @{target} to a battle!\n\n"
             f"❓ Questions: {len(question_ids)}\n"
             f"⏱ Time per question: *{time_per_q}s*\n"
             f"🎮 {mode_tag}\n\n"
-            f"Accept within {BATTLE_INVITE_TIMEOUT} seconds:",
-            parse_mode="Markdown",
-            reply_markup=kb
+            f"Accept within {BATTLE_INVITE_TIMEOUT} seconds:"
         )
+
+        # Send to challenger's chat
+        await query.edit_message_text(
+            invite_text, parse_mode="Markdown", reply_markup=kb
+        )
+
+        # Also send directly to opponent's private chat
+        try:
+            await context.bot.send_message(
+                chat_id=target_id,
+                text=invite_text,
+                parse_mode="Markdown",
+                reply_markup=kb
+            )
+        except Exception as e:
+            logger.error(f"Could not send battle invite to opponent {target_id}: {e}")
+
     except Exception as e:
         logger.error(f"battle_setup_callback error: {e}", exc_info=True)
         await query.edit_message_text(f"❌ Error setting up battle: {e}")
 
-
-# ─── Accept battle ───────────────────────────────────────────────────
 
 async def accept_battle_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -228,29 +218,30 @@ async def accept_battle_handler(update: Update, context: ContextTypes.DEFAULT_TY
         )
 
         question_ids = list(battle["question_ids"])
-        mode_note = (
-            "Check your *private chat* with the bot for questions!" if mode == "dm"
-            else "Questions will appear here in the group!"
-        )
 
-        await query.edit_message_text(
+        started_text = (
             f"⚔️ *BATTLE STARTED!*\n\n"
             f"🔵 {challenger_name} vs 🔴 {user.first_name}\n"
             f"❓ {len(question_ids)} questions | ⏱ {time_per_q}s each\n\n"
-            f"{mode_note}",
-            parse_mode="Markdown"
+            f"Check your private chat with the bot for questions!"
         )
+
+        await query.edit_message_text(started_text, parse_mode="Markdown")
+
+        # Notify challenger too
+        try:
+            await context.bot.send_message(
+                chat_id=battle["challenger"],
+                text=started_text,
+                parse_mode="Markdown"
+            )
+        except Exception:
+            pass
 
         await asyncio.sleep(2)
 
-        if mode == "dm":
-            await _send_dm_question(context, battle["challenger"], battle_id, 0, question_ids, time_per_q)
-            await _send_dm_question(context, user.id, battle_id, 0, question_ids, time_per_q)
-        else:
-            await _send_group_question(
-                context, battle["chat_id"], battle_id, 0,
-                question_ids, time_per_q, battle["challenger"], user.id
-            )
+        await _send_dm_question(context, battle["challenger"], battle_id, 0, question_ids, time_per_q)
+        await _send_dm_question(context, user.id, battle_id, 0, question_ids, time_per_q)
 
     except Exception as e:
         logger.error(f"accept_battle_handler error: {e}", exc_info=True)
@@ -259,8 +250,6 @@ async def accept_battle_handler(update: Update, context: ContextTypes.DEFAULT_TY
         except Exception:
             pass
 
-
-# ─── DM mode ─────────────────────────────────────────────────────────
 
 async def _send_dm_question(context, user_id, battle_id, q_index, question_ids, time_per_q):
     try:
@@ -348,102 +337,6 @@ async def _dm_timeout(context, user_id, battle_id, q_index, question_ids, time_p
     except Exception as e:
         logger.error(f"_dm_timeout error: {e}", exc_info=True)
 
-
-# ─── Group mode ──────────────────────────────────────────────────────
-
-async def _send_group_question(context, chat_id, battle_id, q_index,
-                                question_ids, time_per_q, p1_id, p2_id):
-    try:
-        mcq_id = question_ids[q_index]
-        mcq = await get_mcq_by_id(mcq_id)
-        if not mcq:
-            return
-
-        _battle_q_starts[f"{battle_id}|{q_index}"] = datetime.utcnow().timestamp()
-
-        letters = ["A", "B", "C", "D", "E"]
-        opts = [mcq["option_a"], mcq["option_b"], mcq["option_c"], mcq["option_d"]]
-        if mcq.get("option_e"):
-            opts.append(mcq["option_e"])
-
-        total = len(question_ids)
-        text = (
-            f"⚔️ *BATTLE — Q{q_index+1}/{total}*\n"
-            f"⏱ *{time_per_q} seconds* to answer!\n\n"
-            f"{mcq['question']}\n\n"
-        )
-        for i, opt in enumerate(opts):
-            text += f"*{letters[i]}.* {opt}\n"
-
-        kb = InlineKeyboardMarkup([[
-            InlineKeyboardButton(
-                letters[i],
-                callback_data=_ans_cb(letters[i], mcq["id"], battle_id, q_index)
-            )
-            for i in range(len(opts))
-        ]])
-
-        await context.bot.send_message(
-            chat_id=chat_id, text=text,
-            parse_mode="Markdown", reply_markup=kb
-        )
-
-        task = asyncio.create_task(
-            _group_countdown(context, chat_id, battle_id, q_index,
-                             question_ids, time_per_q, p1_id, p2_id)
-        )
-        _countdown_tasks[f"{battle_id}|{q_index}"] = task
-
-    except Exception as e:
-        logger.error(f"_send_group_question error: {e}", exc_info=True)
-
-
-async def _group_countdown(context, chat_id, battle_id, q_index,
-                            question_ids, time_per_q, p1_id, p2_id):
-    await asyncio.sleep(time_per_q)
-    try:
-        battle = await get_battle(battle_id)
-        if not battle or battle["status"] != "active":
-            return
-
-        answer_times = json.loads(battle.get("answer_times") or "{}")
-        for uid in [p1_id, p2_id]:
-            player_key = f"{q_index}_{uid}"
-            if player_key not in answer_times:
-                answer_times[player_key] = {
-                    "chosen": "-", "correct": False,
-                    "time": time_per_q, "xp": XP_WRONG
-                }
-        await update_battle(battle_id, answer_times=json.dumps(answer_times))
-
-        mcq = await get_mcq_by_id(question_ids[q_index])
-        if mcq:
-            correct_text = {
-                "A": mcq["option_a"], "B": mcq["option_b"],
-                "C": mcq["option_c"], "D": mcq["option_d"]
-            }.get(mcq["correct"], "")
-            try:
-                await context.bot.send_message(
-                    chat_id=chat_id,
-                    text=f"⏰ *Time's up!*\n✅ Correct: *{mcq['correct']}* — {correct_text}",
-                    parse_mode="Markdown"
-                )
-            except Exception:
-                pass
-
-        next_q = q_index + 1
-        if next_q < len(question_ids):
-            await asyncio.sleep(2)
-            await _send_group_question(context, chat_id, battle_id, next_q,
-                                       question_ids, time_per_q, p1_id, p2_id)
-        else:
-            await asyncio.sleep(1)
-            await _finish_battle(context, battle_id)
-    except Exception as e:
-        logger.error(f"_group_countdown error: {e}", exc_info=True)
-
-
-# ─── Answer handler ──────────────────────────────────────────────────
 
 async def battle_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -550,27 +443,10 @@ async def _handle_battle_answer(update: Update, context: ContextTypes.DEFAULT_TY
                 fresh2 = await get_battle(battle_id)
                 sc = json.loads(fresh2["scores"] or "{}")
                 time_per_q = int(sc.get("_time_per_q", 30))
-                is_group_mode = fresh2.get("chat_id") and fresh2["chat_id"] != fresh2["challenger"]
-
-                if is_group_mode:
-                    try:
-                        await context.bot.send_message(
-                            chat_id=fresh2["chat_id"],
-                            text=f"✅ Correct: *{mcq['correct']}* — {correct_text}\nNext question coming up...",
-                            parse_mode="Markdown"
-                        )
-                    except Exception:
-                        pass
-                    await _send_group_question(
-                        context, fresh2["chat_id"], battle_id, next_q,
-                        question_ids, time_per_q,
-                        battle["challenger"], battle["opponent"]
-                    )
-                else:
-                    await _send_dm_question(context, battle["challenger"], battle_id,
-                                            next_q, question_ids, time_per_q)
-                    await _send_dm_question(context, battle["opponent"], battle_id,
-                                            next_q, question_ids, time_per_q)
+                await _send_dm_question(context, battle["challenger"], battle_id,
+                                        next_q, question_ids, time_per_q)
+                await _send_dm_question(context, battle["opponent"], battle_id,
+                                        next_q, question_ids, time_per_q)
             else:
                 await asyncio.sleep(1)
                 await _finish_battle(context, battle_id)
@@ -582,8 +458,6 @@ async def _handle_battle_answer(update: Update, context: ContextTypes.DEFAULT_TY
         except Exception:
             pass
 
-
-# ─── Finish battle ───────────────────────────────────────────────────
 
 async def _finish_battle(context, battle_id):
     try:
@@ -618,14 +492,6 @@ async def _finish_battle(context, battle_id):
             f"🔴 {p2_name}: *{p2_score} pts*\n\n"
             f"{winner}"
         )
-
-        if battle.get("chat_id"):
-            try:
-                await context.bot.send_message(
-                    chat_id=battle["chat_id"], text=result, parse_mode="Markdown"
-                )
-            except Exception as e:
-                logger.error(f"Group result error: {e}")
 
         for uid in [int(p1_id), int(p2_id)]:
             try:
