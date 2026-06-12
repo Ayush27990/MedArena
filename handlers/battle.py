@@ -36,8 +36,10 @@ def _parse_ans_cb(data):
 
 
 async def battle_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/battle — DM mode"""
+    """/battle — DM mode (also triggered by the 'Battle Mode' menu button)"""
     try:
+        if update.callback_query:
+            await update.callback_query.answer()
         await _start_battle_setup(update, context, mode="dm")
     except Exception as e:
         logger.error(f"battle_handler error: {e}", exc_info=True)
@@ -45,7 +47,7 @@ async def battle_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if hasattr(msg, 'edit_message_text'):
             await msg.edit_message_text(f"❌ Error: {e}")
         else:
-            await update.message.reply_text(f"❌ Error: {e}")
+            await update.effective_message.reply_text(f"❌ Error: {e}")
 
 
 async def group_battle_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -54,7 +56,7 @@ async def group_battle_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         await _start_battle_setup(update, context, mode="group")
     except Exception as e:
         logger.error(f"group_battle_handler error: {e}", exc_info=True)
-        await update.message.reply_text(f"❌ Error: {e}")
+        await update.effective_message.reply_text(f"❌ Error: {e}")
 
 
 async def _start_battle_setup(update, context, mode):
@@ -69,7 +71,7 @@ async def _start_battle_setup(update, context, mode):
             f"Usage: `/{('battle' if mode == 'dm' else 'groupbattle')} @username`\n\n"
             f"Example: `/battle @Ayush27990`"
         )
-        await update.message.reply_text(text, parse_mode="Markdown")
+        await update.effective_message.reply_text(text, parse_mode="Markdown")
         return
 
     target_username = args[0].lstrip("@")
@@ -77,7 +79,7 @@ async def _start_battle_setup(update, context, mode):
     # Look up opponent in database by username
     opponent_user = await get_user_by_username(target_username)
     if not opponent_user:
-        await update.message.reply_text(
+        await update.effective_message.reply_text(
             f"❌ @{target_username} hasn't started the bot yet.\n\n"
             f"Ask them to open @MedArena121_bot and send /start first!",
             parse_mode="Markdown"
@@ -98,7 +100,7 @@ async def _start_battle_setup(update, context, mode):
         for t in TIMER_OPTIONS
     ]])
 
-    await update.message.reply_text(
+    await update.effective_message.reply_text(
         f"⚔️ *{mode_label}*\n\n"
         f"Challenging: @{target_username}\n\n"
         f"⏱ Choose seconds per question:",
