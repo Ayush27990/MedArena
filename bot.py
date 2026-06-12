@@ -1,36 +1,29 @@
 """
 MedQuiz Master Bot - Main Entry Point
-NEET PG / INICET / FMGE / USMLE Quiz Ecosystem
 """
 
 import logging
-import asyncio
+from telegram import Update
 from telegram.ext import (
-    Application, CommandHandler, MessageHandler, CallbackQueryHandler,
-    PollAnswerHandler, filters
+    Application, CommandHandler, MessageHandler,
+    CallbackQueryHandler, filters, ContextTypes
 )
 from config import BOT_TOKEN
 from handlers.start import start_handler, help_handler
-from handlers.import_mcq import (
-    handle_poll, handle_text_mcq, handle_document, handle_photo
-)
-from handlers.quiz import (
-    quiz_menu_handler, start_group_quiz, join_quiz_handler,
-    quiz_callback_handler
-)
+from handlers.import_mcq import handle_poll, handle_text_mcq, handle_document, handle_photo
+from handlers.quiz import quiz_menu_handler, start_group_quiz, join_quiz_handler, quiz_callback_handler
 from handlers.battle import (
-    battle_handler, accept_battle_handler, battle_callback_handler
+    battle_handler, group_battle_handler, battle_setup_callback,
+    accept_battle_handler, battle_callback_handler
 )
 from handlers.stats import stats_handler, leaderboard_handler
 from handlers.revision import (
-    revision_handler, bookmarks_handler, wrong_bank_handler,
-    revision_callback_handler
+    revision_handler, bookmarks_handler, wrong_bank_handler, revision_callback_handler
 )
 from handlers.admin import (
-    admin_handler, admin_callback_handler, handle_admin_search,
-    pending_approval_handler
+    admin_handler, admin_callback_handler, handle_admin_search, pending_approval_handler
 )
-from handlers.search import search_handler, search_callback_handler
+from handlers.search import search_handler, search_callback_handler, handle_search_text
 from services.database import init_db
 
 logging.basicConfig(
@@ -43,6 +36,14 @@ logger = logging.getLogger(__name__)
 async def post_init(application: Application) -> None:
     await init_db()
     logger.info("Database initialized successfully")
+
+
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Routes text to search keyword handler first, then admin."""
+    handled = await handle_search_text(update, context)
+    if handled:
+        return
+    await handle_admin_search(update, context)
 
 
 def main():
@@ -62,8 +63,9 @@ def main():
     app.add_handler(CommandHandler("startquiz", start_group_quiz))
     app.add_handler(CommandHandler("joingame", join_quiz_handler))
 
-    # Battle
+    # Battle — DM mode and Group mode
     app.add_handler(CommandHandler("battle", battle_handler))
+    app.add_handler(CommandHandler("groupbattle", group_battle_handler))
 
     # Stats & Leaderboard
     app.add_handler(CommandHandler("stats", stats_handler))
@@ -81,35 +83,30 @@ def main():
     app.add_handler(CommandHandler("admin", admin_handler))
     app.add_handler(CommandHandler("pending", pending_approval_handler))
 
-    # MCQ Import - polls (both from groups AND channels)
+    # MCQ Import
     app.add_handler(MessageHandler(filters.POLL, handle_poll))
     app.add_handler(MessageHandler(filters.UpdateType.CHANNEL_POSTS & filters.POLL, handle_poll))
-
-    # MCQ Import - text
     app.add_handler(MessageHandler(
         filters.TEXT & filters.Regex(r'(?i)(^\d+[\.\)]|^Q[\.\)]|^Question)'),
         handle_text_mcq
     ))
-
-    # MCQ Import - files & images
     app.add_handler(MessageHandler(filters.Document.PDF, handle_document))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
 
-    # Admin text input (search, edit etc.)
-    app.add_handler(MessageHandler(
-        filters.TEXT & ~filters.COMMAND,
-        handle_admin_search
-    ))
+    # Text handler (search keywords + admin)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
-    # Callback queries (inline buttons)
+    # Callback queries
     app.add_handler(CallbackQueryHandler(quiz_callback_handler, pattern=r'^quiz_'))
     app.add_handler(CallbackQueryHandler(quiz_callback_handler, pattern=r'^my_stats$'))
     app.add_handler(CallbackQueryHandler(quiz_callback_handler, pattern=r'^leaderboard$'))
+    app.add_handler(CallbackQueryHandler(battle_setup_callback, pattern=r'^bsetup_timer_'))
+    app.add_handler(CallbackQueryHandler(accept_battle_handler, pattern=r'^accept_battle_'))
     app.add_handler(CallbackQueryHandler(battle_callback_handler, pattern=r'^battle_'))
+    app.add_handler(CallbackQueryHandler(battle_callback_handler, pattern=r'^ba\|'))
     app.add_handler(CallbackQueryHandler(revision_callback_handler, pattern=r'^rev_'))
     app.add_handler(CallbackQueryHandler(admin_callback_handler, pattern=r'^adm_'))
     app.add_handler(CallbackQueryHandler(search_callback_handler, pattern=r'^srch_'))
-    app.add_handler(CallbackQueryHandler(accept_battle_handler, pattern=r'^accept_battle_'))
 
     logger.info("MedQuiz Master Bot starting...")
     app.run_polling(drop_pending_updates=True)
