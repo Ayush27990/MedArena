@@ -287,9 +287,10 @@ async def _send_dm_question(context, user_id, battle_id, q_index, question_ids, 
             parse_mode="Markdown", reply_markup=kb
         )
 
-        asyncio.create_task(
+        task = asyncio.create_task(
             _dm_timeout(context, user_id, battle_id, q_index, question_ids, time_per_q)
         )
+        _countdown_tasks[f"{battle_id}|{q_index}|{user_id}"] = task
     except Exception as e:
         logger.error(f"_send_dm_question error for {user_id}: {e}", exc_info=True)
 
@@ -299,6 +300,11 @@ async def _dm_timeout(context, user_id, battle_id, q_index, question_ids, time_p
     try:
         battle = await get_battle(battle_id)
         if not battle or battle["status"] != "active":
+            return
+
+        # Stale timeout: the battle has already moved past this question
+        # (both players answered earlier and it was already advanced).
+        if int(battle.get("current_q", q_index)) != q_index:
             return
 
         answer_times = json.loads(battle.get("answer_times") or "{}")
@@ -325,17 +331,35 @@ async def _dm_timeout(context, user_id, battle_id, q_index, question_ids, time_p
         fresh_times = json.loads(fresh.get("answer_times") or "{}")
 
         if other_key in fresh_times:
-            next_q = q_index + 1
-            if next_q < len(question_ids):
-                await asyncio.sleep(1)
-                await _send_dm_question(context, battle["challenger"], battle_id,
-                                        next_q, question_ids, time_per_q)
-                await _send_dm_question(context, battle["opponent"], battle_id,
-                                        next_q, question_ids, time_per_q)
-            else:
-                await _finish_battle(context, battle_id)
+            await asyncio.sleep(1)
+            await _advance_battle(context, battle_id, q_index, question_ids, time_per_q)
     except Exception as e:
         logger.error(f"_dm_timeout error: {e}", exc_info=True)
+
+
+async def _advance_battle(context, battle_id, q_index, question_ids, time_per_q):
+    """Move the battle on to the next question (or finish it).
+
+    Guarded by `current_q` so that if both _handle_battle_answer and a
+    _dm_timeout race to advance the same question, only the first one
+    actually sends the next question / finishes the battle.
+    """
+    battle = await get_battle(battle_id)
+    if not battle or battle["status"] != "active":
+        return
+    if int(battle.get("current_q", q_index)) != q_index:
+        return  # already advanced by the other path
+
+    next_q = q_index + 1
+    await update_battle(battle_id, current_q=next_q)
+
+    if next_q < len(question_ids):
+        await _send_dm_question(context, battle["challenger"], battle_id,
+                                next_q, question_ids, time_per_q)
+        await _send_dm_question(context, battle["opponent"], battle_id,
+                                next_q, question_ids, time_per_q)
+    else:
+        await _finish_battle(context, battle_id)
 
 
 async def battle_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -432,24 +456,18 @@ async def _handle_battle_answer(update: Update, context: ContextTypes.DEFAULT_TY
 
         if both_answered:
             question_ids = list(battle["question_ids"])
-            next_q = q_index + 1
 
-            task = _countdown_tasks.pop(f"{battle_id}|{q_index}", None)
-            if task:
-                task.cancel()
+            for uid in (battle["challenger"], battle["opponent"]):
+                task = _countdown_tasks.pop(f"{battle_id}|{q_index}|{uid}", None)
+                if task:
+                    task.cancel()
 
-            if next_q < len(question_ids):
-                await asyncio.sleep(2)
-                fresh2 = await get_battle(battle_id)
-                sc = json.loads(fresh2["scores"] or "{}")
-                time_per_q = int(sc.get("_time_per_q", 30))
-                await _send_dm_question(context, battle["challenger"], battle_id,
-                                        next_q, question_ids, time_per_q)
-                await _send_dm_question(context, battle["opponent"], battle_id,
-                                        next_q, question_ids, time_per_q)
-            else:
-                await asyncio.sleep(1)
-                await _finish_battle(context, battle_id)
+            fresh2 = await get_battle(battle_id)
+            sc = json.loads(fresh2["scores"] or "{}")
+            time_per_q = int(sc.get("_time_per_q", 30))
+
+            await asyncio.sleep(2)
+            await _advance_battle(context, battle_id, q_index, question_ids, time_per_q)
 
     except Exception as e:
         logger.error(f"_handle_battle_answer error: {e}", exc_info=True)
