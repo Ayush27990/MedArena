@@ -1,11 +1,9 @@
 """
 MCQ Import Handler
-Handles the 3-step format from channels/groups:
-  Step 1: Text message with full question + options
-  Step 2: Poll with correct answer
-  Step 3: Text message with explanation
-
-Also handles: forwarded polls, PDFs, images
+3-step format from channels/groups:
+  Step 1: Text message with full question + options (saved)
+  Step 2: Poll (ignored for correct answer since channels use anonymous polls)
+  Step 3: Explanation text → AI determines correct answer from explanation
 """
 
 import hashlib
@@ -13,19 +11,19 @@ import logging
 import base64
 import io
 import re
-from telegram import Update, Message
+from telegram import Update
 from telegram.ext import ContextTypes
 from config import ADMIN_IDS, SOURCE_CHAT_IDS
-from services.database import insert_mcq, update_mcq_explanation_by_hash
+from services.database import insert_mcq, update_mcq_explanation_by_hash, update_mcq
 from services.ai_service import (
-    categorize_mcq, parse_text_mcq, parse_pdf_text, ocr_image_to_mcqs
+    categorize_mcq, parse_text_mcq, parse_pdf_text, ocr_image_to_mcqs, find_correct_answer_from_explanation
 )
 
 logger = logging.getLogger(__name__)
 
 # In-memory stores per chat_id
-_pending_question: dict = {}     # chat_id -> {question, options} from text step
-_pending_explanation: dict = {}  # chat_id -> {hash} waiting for explanation text
+_pending_question: dict = {}     # chat_id -> {question, options, hash} from text step
+_pending_explanation: dict = {}  # chat_id -> {hash, options} waiting for explanation
 
 
 def _make_hash(question: str, option_a: str) -> str:
@@ -42,14 +40,7 @@ def _is_monitored_chat(chat_id: int) -> bool:
 
 
 def _parse_options_from_text(text: str):
-    """
-    Extract question and options from text like:
-    Full question text here
-    A. Option one
-    B. Option two
-    C. Option three
-    D. Option four
-    """
+    """Extract question and options from text."""
     lines = text.strip().split('\n')
     options = []
     question_lines = []
@@ -63,7 +54,7 @@ def _parse_options_from_text(text: str):
         if match:
             options.append(match.group(1).strip())
         else:
-            if not options:  # Only add to question if we haven't started options yet
+            if not options:
                 question_lines.append(line)
 
     question = ' '.join(question_lines).strip()
@@ -98,10 +89,8 @@ async def _process_mcq_dict(mcq: dict, source_type: str, chat_id: int,
 
     explanation = mcq.get("explanation") or ""
 
-    # AI for subject/topic/difficulty ONLY — never touches answer or explanation
+    # AI for subject/topic/difficulty ONLY
     cat = await categorize_mcq(q, opts)
-    if not explanation and cat.get("explanation"):
-        explanation = cat["explanation"]
 
     mcq_hash = _make_hash(q, option_a)
 
@@ -133,7 +122,7 @@ async def _process_mcq_dict(mcq: dict, source_type: str, chat_id: int,
 async def handle_channel_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Captures text from monitored channels/groups that looks like an MCQ.
-    Saves it as pending, waiting for the poll to provide the correct answer.
+    Saves it as pending, waiting for the poll then explanation.
     """
     msg = update.message or update.channel_post
     if not msg or not msg.text:
@@ -150,19 +139,16 @@ async def handle_channel_text(update: Update, context: ContextTypes.DEFAULT_TYPE
         _pending_question[chat_id] = {
             "question": question,
             "options": options,
-            "full_text": text,
         }
         logger.info(f"Saved pending question from chat {chat_id}: {question[:50]}")
 
 
-# ─── Step 2: Poll with correct answer ────────────────────────────────
+# ─── Step 2: Poll (just triggers storing the MCQ, answer TBD from explanation) ──
 
 async def handle_poll(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    When a poll arrives:
-    - If there's a pending text question for this chat, use that question + options
-      but take correct answer from the poll
-    - Otherwise fall back to using poll question directly
+    When poll arrives, store the MCQ with a placeholder correct answer.
+    The real correct answer will be determined from the explanation in step 3.
     """
     msg = update.message or update.channel_post
     if not msg:
@@ -178,68 +164,76 @@ async def handle_poll(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not poll:
         return
 
-    correct_idx = poll.correct_option_id
-    correct_letter = chr(65 + correct_idx) if correct_idx is not None else None
-    poll_explanation = poll.explanation or ""
-
     imported_by = msg.from_user.id if msg.from_user else 0
     auto_approve = _is_admin(imported_by)
 
-    # Check if we have a pending text question for this chat
+    # Check if we have a pending text question
     pending = _pending_question.pop(chat_id, None)
 
     if pending and pending.get("question") and len(pending.get("options", [])) >= 2:
-        # Use the full question from text, correct answer from poll
         question = pending["question"]
         options = pending["options"]
-        logger.info(f"Matched poll correct answer {correct_letter} to text question: {question[:50]}")
     else:
-        # Fall back to poll's own question
+        # Fall back to poll question
         question = poll.question.strip()
         options = [o.text.strip() for o in poll.options]
-        logger.info(f"Using poll question directly: {question[:50]}")
 
     if not question or len(options) < 2:
         return
 
+    # For channel anonymous polls, we can't get correct answer
+    # Store with placeholder "A", explanation step will fix it
+    correct_idx = poll.correct_option_id
+    if correct_idx is not None:
+        # Non-anonymous poll — we can read the answer directly!
+        correct_letter = chr(65 + correct_idx)
+    else:
+        # Anonymous poll — placeholder, will be fixed by explanation
+        correct_letter = "A"
+
+    poll_explanation = poll.explanation or ""
+
     mcq = {
         "question": question,
         "options": options,
-        "correct": correct_letter if correct_letter is not None else "A",
+        "correct": correct_letter,
         "explanation": poll_explanation,
     }
 
     mcq_hash = await _process_mcq_dict(mcq, "poll", chat_id, imported_by, auto_approve)
 
     if mcq_hash:
-        # Store hash waiting for explanation text
-        _pending_explanation[chat_id] = {"hash": mcq_hash}
-        logger.info(f"MCQ stored, waiting for explanation. Hash: {mcq_hash}")
+        # Store for explanation step — include options so AI can match answer
+        _pending_explanation[chat_id] = {
+            "hash": mcq_hash,
+            "options": options,
+            "question": question,
+            "has_real_answer": correct_idx is not None,
+        }
+        logger.info(f"MCQ stored with placeholder answer. Hash: {mcq_hash}")
 
     if is_private:
         if mcq_hash:
             status = "✅ Added & approved" if auto_approve else "📥 Added — pending admin review"
-            correct_display = f"Correct: *{correct_letter}*" if correct_letter else "⚠️ No correct answer marked"
             await msg.reply_text(
-                f"{status}\n\n"
-                f"📌 *{question[:80]}*\n"
-                f"{correct_display}\n\n"
-                f"💡 Send the explanation as your next message to update it.",
+                f"{status}\n\n📌 *{question[:80]}*\n\n"
+                f"💡 Now send the explanation — I'll determine the correct answer from it!",
                 parse_mode="Markdown"
             )
         else:
             await msg.reply_text(
-                f"⚠️ *Duplicate* — this question already exists.\n\n"
-                f"📌 _{question[:60]}_",
+                f"⚠️ *Duplicate* — this question already exists.\n\n📌 _{question[:60]}_",
                 parse_mode="Markdown"
             )
 
 
-# ─── Step 3: Explanation text ─────────────────────────────────────────
+# ─── Step 3: Explanation text → AI finds correct answer ──────────────
 
 async def handle_explanation_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     """
-    If the previous message was a poll, treat this text as the explanation.
+    After a poll, the explanation text arrives.
+    AI reads the explanation and determines which option (A/B/C/D) is correct.
+    Then updates both the explanation and correct answer in the database.
     Returns True if handled.
     """
     msg = update.message or update.channel_post
@@ -253,22 +247,43 @@ async def handle_explanation_text(update: Update, context: ContextTypes.DEFAULT_
 
     text = msg.text.strip()
 
-    # Skip if it looks like a new MCQ question
+    # Skip if too short
     if len(text) < 10:
         return False
 
-    # Skip if it looks like option lines (new MCQ incoming)
+    # Skip if it looks like a new MCQ (has 3+ option lines)
     option_pattern = re.compile(r'^[A-Ea-e][.)]\s*.+', re.IGNORECASE | re.MULTILINE)
     if len(option_pattern.findall(text)) >= 3:
+        # This looks like a new question, clear pending and save as new pending
+        _pending_explanation.pop(chat_id, None)
         return False
 
     try:
-        await update_mcq_explanation_by_hash(pending["hash"], text)
+        mcq_hash = pending["hash"]
+        options = pending["options"]
+        question = pending["question"]
+        has_real_answer = pending.get("has_real_answer", False)
+
+        # Update explanation first
+        await update_mcq_explanation_by_hash(mcq_hash, text)
+
+        # Only use AI to find answer if poll was anonymous (no real answer)
+        if not has_real_answer:
+            correct_letter = await find_correct_answer_from_explanation(
+                question, options, text
+            )
+            if correct_letter and correct_letter in "ABCDE":
+                # Update the correct answer in database
+                from services.database import update_mcq_by_hash
+                await update_mcq_by_hash(mcq_hash, "correct", correct_letter)
+                logger.info(f"AI determined correct answer: {correct_letter} from explanation")
+
         _pending_explanation.pop(chat_id, None)
-        logger.info(f"Updated explanation for hash {pending['hash']}")
+        logger.info(f"Updated explanation and correct answer for hash {mcq_hash}")
         return True
+
     except Exception as e:
-        logger.error(f"Failed to update explanation: {e}")
+        logger.error(f"Failed to update explanation/answer: {e}")
         return False
 
 
@@ -282,11 +297,9 @@ async def handle_text_mcq(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     imported_by = msg.from_user.id if msg.from_user else 0
 
-    # Only process in private chat or from admins
     if msg.chat.type != "private" and not _is_admin(imported_by):
         return
 
-    # Check if this is an explanation for a previous poll
     if await handle_explanation_text(update, context):
         return
 
