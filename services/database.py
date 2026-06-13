@@ -421,3 +421,16 @@ async def get_user_by_username(username: str):
             "SELECT * FROM users WHERE LOWER(username) = LOWER($1)",
             username.lstrip("@")
         )
+
+
+async def update_mcq_by_hash(hash: str, field: str, value: str):
+    """Update a specific field for an MCQ identified by its hash."""
+    allowed = {"correct", "explanation", "subject", "topic", "difficulty"}
+    if field not in allowed:
+        return
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            f"UPDATE mcqs SET {field}=$1, updated_at=NOW() WHERE hash=$2",
+            value, hash
+        )
