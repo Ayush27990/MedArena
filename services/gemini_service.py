@@ -27,16 +27,33 @@ class GeminiError(Exception):
     """Raised when Gemini cannot produce MCQs. The message is safe to show the admin."""
 
 
-def _build_prompt(topic: str, count: int) -> str:
-    return f"""You are an expert medical examiner writing MCQs for NEET PG / INICET / FMGE preparation.
+def _build_prompt(topic: str, count: int, level: str | None = None,
+                  avoid: list[str] | None = None) -> str:
+    if level and "usmle" in level.lower():
+        exam = "USMLE Step 1 / Step 2 CK"
+        style = ("- USMLE style: a compact clinical vignette (age, sex, key findings) that asks for the "
+                 "mechanism, diagnosis or next best step. Keep it short: Telegram polls allow only 300 characters.")
+    elif level:
+        exam = "NEET PG / INICET"
+        style = "- Prefer clinical-vignette or high-yield recall questions, in the style of recent NEET PG papers."
+    else:
+        exam = "NEET PG / INICET / FMGE"
+        style = "- Prefer clinical-vignette or high-yield recall questions, in the style of recent NEET PG papers."
+
+    avoid_block = ""
+    if avoid:
+        lines = "\n".join(f"  * {q[:120]}" for q in avoid[:25])
+        avoid_block = f"\n- These questions already exist. Do NOT test the same concept again:\n{lines}"
+
+    return f"""You are an expert medical examiner writing MCQs for {exam} preparation.
 
 Write exactly {count} high-quality, exam-style MCQs on: {topic}
 
 Rules:
-- Prefer clinical-vignette or high-yield recall questions, in the style of recent NEET PG papers.
+{style}
 - Exactly 4 options per question. Exactly ONE is correct. Wrong options must be plausible.
 - Be factually accurate according to standard textbooks. Do not invent facts. If unsure, skip that point.
-- Do not repeat the same concept twice.
+- Do not repeat the same concept twice.{avoid_block}
 - Question: at most 280 characters. Each option: at most 90 characters. No "A." / "B." prefixes inside options.
 - Explanation: one or two short sentences, at most 180 characters, saying why the answer is correct.
 - "correct" is a single letter: A, B, C or D.
@@ -94,7 +111,8 @@ def _clean_mcqs(raw_items: list) -> tuple[list[dict], int]:
     return good, dropped
 
 
-async def generate_mcqs(topic: str, count: int = 5) -> tuple[list[dict], int]:
+async def generate_mcqs(topic: str, count: int = 5, level: str | None = None,
+                        avoid: list[str] | None = None) -> tuple[list[dict], int]:
     """
     Ask Gemini for `count` MCQs on `topic`.
     Returns (mcqs, dropped) where dropped = how many Gemini items were unusable.
@@ -111,7 +129,7 @@ async def generate_mcqs(topic: str, count: int = 5) -> tuple[list[dict], int]:
 
     headers = {"x-goog-api-key": GEMINI_API_KEY, "Content-Type": "application/json"}
     payload = {
-        "contents": [{"parts": [{"text": _build_prompt(topic, count)}]}],
+        "contents": [{"parts": [{"text": _build_prompt(topic, count, level, avoid)}]}],
         "generationConfig": {"temperature": 0.6},
     }
     waits = [3, 6, 12]          # pause before retry 2, 3, 4 (per model)
