@@ -1,5 +1,8 @@
+
 """
-Battle Mode Handler — 1v1 real-time MCQ battles
+MedArena Battle Mode — 1v1 real-time MCQ battles
+Fixed invitation delivery, opponent verification, topic setup,
+timeouts, duplicate answers and question progression.
 """
 
 import json
@@ -7,9 +10,12 @@ import uuid
 import random
 import asyncio
 import logging
-from datetime import datetime
+import time
+
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes, ApplicationHandlerStop
+from telegram.error import TelegramError
+
 from services.database import (
     get_mcqs_for_quiz, create_battle, get_battle, update_battle,
     get_mcq_by_id, record_answer, add_xp, get_user_by_username,
@@ -19,107 +25,86 @@ from services.gemini_service import generate_mcqs, GeminiError
 from handlers.import_mcq import _make_hash
 from config import (
     BATTLE_INVITE_TIMEOUT, XP_CORRECT,
-    XP_SPEED_BONUS, BATTLE_BONUS_SPEED_SECONDS, XP_WRONG, SUBJECTS
+    XP_SPEED_BONUS, BATTLE_BONUS_SPEED_SECONDS,
+    XP_WRONG, SUBJECTS
 )
 
 logger = logging.getLogger(__name__)
-
-_battle_q_starts: dict = {}
-_countdown_tasks: dict = {}
 
 TIMER_OPTIONS = [15, 20, 30, 45, 60]
 BATTLE_QUESTIONS = 10
 BATTLE_EXPLANATION_CHARS = 400
 
+# In-process locks prevent simultaneous updates from overwriting one another.
+_battle_locks = {}
+_battle_starts = {}
+_battle_tasks = {}
 
-def _md(text) -> str:
-    """Escape Telegram legacy-Markdown characters so AI text can't break a message."""
+
+def _lock(battle_id):
+    if battle_id not in _battle_locks:
+        _battle_locks[battle_id] = asyncio.Lock()
+    return _battle_locks[battle_id]
+
+
+def _json(value):
+    if isinstance(value, dict):
+        return value
+    if not value:
+        return {}
+    try:
+        return json.loads(value)
+    except (TypeError, ValueError):
+        return {}
+
+
+def _md(text):
     out = str(text or "")
     for ch in ("\\", "_", "*", "`", "["):
         out = out.replace(ch, "\\" + ch)
     return out
 
 
-def _subject_pool() -> list[str]:
-    return [x for x in SUBJECTS if x != "Other"]
+def _subject_pool():
+    return [s for s in SUBJECTS if s != "Other"]
 
 
-def _subject_keyboard() -> InlineKeyboardMarkup:
+def _subject_keyboard():
     pool = _subject_pool()
     rows = [
-        [InlineKeyboardButton("🎲 Mixed (all subjects)", callback_data="bsetup_subj_all")],
-        [InlineKeyboardButton("✍️ Type my own topic", callback_data="bsetup_typeany")],
+        [InlineKeyboardButton(
+            "🎲 Mixed (all subjects)",
+            callback_data="bsetup_subj_all"
+        )],
+        [InlineKeyboardButton(
+            "✍️ Type my own topic",
+            callback_data="bsetup_typeany"
+        )]
     ]
+
     for i in range(0, len(pool), 2):
         rows.append([
-            InlineKeyboardButton(pool[j][:24], callback_data=f"bsetup_subj_{j}")
+            InlineKeyboardButton(
+                pool[j][:24],
+                callback_data=f"bsetup_subj_{j}"
+            )
             for j in range(i, min(i + 2, len(pool)))
         ])
+
     return InlineKeyboardMarkup(rows)
 
 
-def _subject_action_keyboard() -> InlineKeyboardMarkup:
+def _subject_action_keyboard():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("⭐ Whole subject (high yield)", callback_data="bsetup_whole")],
-        [InlineKeyboardButton("✍️ Type a topic in this subject", callback_data="bsetup_typesub")],
+        [InlineKeyboardButton(
+            "⭐ Whole subject (high yield)",
+            callback_data="bsetup_whole"
+        )],
+        [InlineKeyboardButton(
+            "✍️ Type a topic in this subject",
+            callback_data="bsetup_typesub"
+        )]
     ])
-
-
-async def _gemini_battle_question_ids(count: int = BATTLE_QUESTIONS,
-                                      subject: str | None = None,
-                                      topic: str | None = None) -> list[int]:
-    """Ask Gemini for very high-yield MCQs, save them (approved, so they join the question
-    bank) and return their database ids.
-    subject=None, topic=None -> mixed: one question from each of `count` different subjects.
-    subject="X"  -> `count` different questions all on X.
-    topic="T"    -> `count` different questions on topic T (inside `subject` if given)."""
-    pool = _subject_pool()
-    if topic:
-        try:
-            avoid = [r["question"] for r in await search_mcqs(keyword=topic, limit=25)]
-        except Exception:
-            avoid = []
-        scope = (subject + " - " + topic) if subject else topic
-        mcqs, _ = await generate_mcqs(
-            "very high-yield exam questions on the topic: " + scope +
-            ". Cover different important facts and clinical points of this topic.",
-            count, avoid=avoid, high_yield=True, expl_chars=BATTLE_EXPLANATION_CHARS,
-        )
-        if subject:
-            for m in mcqs:
-                m["subject"] = subject
-    elif subject:
-        try:
-            avoid = [r["question"] for r in await search_mcqs(subject=subject, limit=25)]
-        except Exception:
-            avoid = []
-        mcqs, _ = await generate_mcqs(
-            f"{subject}: very high-yield exam questions, each on a different topic within {subject}", count,
-            avoid=avoid, high_yield=True, expl_chars=BATTLE_EXPLANATION_CHARS,
-        )
-        for m in mcqs:
-            m["subject"] = subject
-    else:
-        subjects = random.sample(pool, min(count, len(pool)))
-        mcqs, _ = await generate_mcqs(
-            "very high-yield exam questions across the listed subjects", len(subjects),
-            subjects=subjects, high_yield=True, expl_chars=BATTLE_EXPLANATION_CHARS,
-        )
-    ids = []
-    for m in mcqs:
-        opts = m["options"]
-        h = _make_hash(m["question"], opts[0])
-        new_id = await insert_mcq({
-            "question": m["question"],
-            "option_a": opts[0], "option_b": opts[1], "option_c": opts[2], "option_d": opts[3],
-            "correct": m["correct"], "explanation": m.get("explanation"),
-            "subject": m.get("subject") if m.get("subject") in pool else None,
-            "topic": topic or "", "difficulty": "NEET PG",
-            "source_type": "gemini_battle", "source_chat": 0, "imported_by": 0,
-            "approved": True, "hash": h,
-        })
-        ids.append(new_id or await get_mcq_id_by_hash(h))
-    return [i for i in ids if i]
 
 
 def _ans_cb(letter, mcq_id, battle_id, q_index):
@@ -131,271 +116,434 @@ def _parse_ans_cb(data):
     return letter, int(mcq_id), battle_id, int(q_index)
 
 
-async def battle_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/battle — DM mode (also triggered by the 'Battle Mode' menu button)"""
+async def _gemini_battle_question_ids(
+    count=BATTLE_QUESTIONS,
+    subject=None,
+    topic=None
+):
+    pool = _subject_pool()
+
+    if topic:
+        try:
+            avoid = [
+                r["question"]
+                for r in await search_mcqs(keyword=topic, limit=25)
+            ]
+        except Exception:
+            avoid = []
+
+        scope = f"{subject} - {topic}" if subject else topic
+
+        mcqs, _ = await generate_mcqs(
+            "Very high-yield medical exam questions on: " + scope +
+            ". Cover different important facts and clinical points.",
+            count,
+            avoid=avoid,
+            high_yield=True,
+            expl_chars=BATTLE_EXPLANATION_CHARS
+        )
+
+        if subject:
+            for m in mcqs:
+                m["subject"] = subject
+
+    elif subject:
+        try:
+            avoid = [
+                r["question"]
+                for r in await search_mcqs(subject=subject, limit=25)
+            ]
+        except Exception:
+            avoid = []
+
+        mcqs, _ = await generate_mcqs(
+            f"{subject}: very high-yield questions on different topics",
+            count,
+            avoid=avoid,
+            high_yield=True,
+            expl_chars=BATTLE_EXPLANATION_CHARS
+        )
+
+        for m in mcqs:
+            m["subject"] = subject
+
+    else:
+        subjects = random.sample(
+            pool, min(count, len(pool))
+        )
+
+        mcqs, _ = await generate_mcqs(
+            "Very high-yield medical exam questions across subjects",
+            len(subjects),
+            subjects=subjects,
+            high_yield=True,
+            expl_chars=BATTLE_EXPLANATION_CHARS
+        )
+
+    ids = []
+
+    for m in mcqs:
+        opts = m["options"]
+
+        if len(opts) < 4:
+            continue
+
+        correct = str(m["correct"]).upper()
+        if correct not in ("A", "B", "C", "D"):
+            continue
+
+        h = _make_hash(m["question"], opts[0])
+
+        new_id = await insert_mcq({
+            "question": m["question"],
+            "option_a": opts[0],
+            "option_b": opts[1],
+            "option_c": opts[2],
+            "option_d": opts[3],
+            "correct": correct,
+            "explanation": m.get("explanation"),
+            "subject": (
+                m.get("subject")
+                if m.get("subject") in pool else None
+            ),
+            "topic": topic or "",
+            "difficulty": "NEET PG",
+            "source_type": "gemini_battle",
+            "source_chat": 0,
+            "imported_by": 0,
+            "approved": True,
+            "hash": h
+        })
+
+        mcq_id = new_id or await get_mcq_id_by_hash(h)
+
+        if mcq_id:
+            ids.append(mcq_id)
+
+    return ids[:count]
+
+
+async def battle_handler(update, context):
     try:
         if update.callback_query:
             await update.callback_query.answer()
-        await _start_battle_setup(update, context, mode="dm")
+
+        await _start_battle_setup(update, context, "dm")
+
     except Exception as e:
-        logger.error(f"battle_handler error: {e}", exc_info=True)
-        msg = update.callback_query or update.message
-        if hasattr(msg, 'edit_message_text'):
-            await msg.edit_message_text(f"❌ Error: {e}")
-        else:
-            await update.effective_message.reply_text(f"❌ Error: {e}")
+        logger.exception("Battle handler error")
+        await update.effective_message.reply_text(
+            f"❌ Battle error: {e}"
+        )
 
 
-async def group_battle_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/groupbattle — Group mode"""
+async def group_battle_handler(update, context):
     try:
-        await _start_battle_setup(update, context, mode="group")
-    except Exception as e:
-        logger.error(f"group_battle_handler error: {e}", exc_info=True)
-        await update.effective_message.reply_text(f"❌ Error: {e}")
+        await _start_battle_setup(update, context, "group")
+    except Exception:
+        logger.exception("Group battle handler error")
+        await update.effective_message.reply_text(
+            "❌ Could not start group battle setup."
+        )
 
 
 async def _start_battle_setup(update, context, mode):
     user = update.effective_user
     args = context.args or []
 
-    mode_label = "DM Battle 🔒" if mode == "dm" else "Group Battle 👥"
-
     if not args:
-        text = (
-            f"⚔️ *{mode_label}*\n\n"
-            f"Usage: `/{('battle' if mode == 'dm' else 'groupbattle')} @username`\n\n"
-            f"Example: `/battle @Ayush27990`"
+        command = "battle" if mode == "dm" else "groupbattle"
+        await update.effective_message.reply_text(
+            f"⚔️ Battle Mode\n\n"
+            f"Usage: /{command} @username\n\n"
+            f"Example: /{command} @Ayush27990"
         )
-        await update.effective_message.reply_text(text, parse_mode="Markdown")
         return
 
-    target_username = args[0].lstrip("@")
+    target = args[0].lstrip("@").strip()
 
-    # Look up opponent in database by username
-    opponent_user = await get_user_by_username(target_username)
-    if not opponent_user:
+    if not target:
         await update.effective_message.reply_text(
-            f"❌ @{target_username} hasn't started the bot yet.\n\n"
-            f"Ask them to open @MedArena121_bot and send /start first!",
-            parse_mode="Markdown"
+            "❌ Please provide a valid username."
+        )
+        return
+
+    opponent = await get_user_by_username(target)
+
+    if not opponent:
+        await update.effective_message.reply_text(
+            f"❌ @{target} is not registered with MedArena.\n\n"
+            "Ask them to open @MedArena121_bot and send /start."
+        )
+        return
+
+    target_id = int(opponent["user_id"])
+
+    if target_id == user.id:
+        await update.effective_message.reply_text(
+            "❌ You cannot challenge yourself."
         )
         return
 
     context.user_data["battle_setup"] = {
         "mode": mode,
-        "target": target_username,
-        "target_id": opponent_user["user_id"],
+        "target": target,
+        "target_id": target_id,
         "chat_id": update.effective_chat.id,
         "challenger_id": user.id,
-        "challenger_name": user.first_name or "Challenger",
+        "challenger_name": user.first_name or "Challenger"
     }
 
     kb = InlineKeyboardMarkup([[
-        InlineKeyboardButton(f"{t}s", callback_data=f"bsetup_timer_{t}")
+        InlineKeyboardButton(
+            f"{t}s",
+            callback_data=f"bsetup_timer_{t}"
+        )
         for t in TIMER_OPTIONS
     ]])
 
     await update.effective_message.reply_text(
-        f"⚔️ *{mode_label}*\n\n"
-        f"Challenging: @{target_username}\n\n"
-        f"⏱ Choose seconds per question:",
-        parse_mode="Markdown",
+        f"⚔️ {'DM Battle 🔒' if mode == 'dm' else 'Group Battle 👥'}\n\n"
+        f"Opponent: @{target}\n\n"
+        "⏱ Choose seconds per question:",
         reply_markup=kb
     )
 
 
-async def battle_setup_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Setup buttons: timer -> subject -> (whole subject | typed topic)."""
+async def battle_setup_callback(update, context):
     query = update.callback_query
     await query.answer()
+
     user = update.effective_user
     setup = context.user_data.get("battle_setup")
+
     if not setup or setup["challenger_id"] != user.id:
-        await query.edit_message_text("❌ Setup expired. Please run the command again.")
+        await query.edit_message_text(
+            "❌ Setup expired. Run /battle again."
+        )
         return
 
     data = query.data
 
-    # Step 1: timer
     if data.startswith("bsetup_timer_"):
-        setup["time_per_q"] = int(data.replace("bsetup_timer_", ""))
-        setup["await_topic"] = False
+        seconds = int(data.split("_")[-1])
+
+        if seconds not in TIMER_OPTIONS:
+            return
+
+        setup["time_per_q"] = seconds
         setup["subject"] = None
+        setup["await_topic"] = False
+
         await query.edit_message_text(
-            f"⚔️ Challenging @{setup['target']} · ⏱ {setup['time_per_q']}s per question\n\n"
-            "📚 Choose the battle subject, or type your own topic:",
+            f"⚔️ Challenging @{setup['target']}\n"
+            f"⏱ {seconds}s per question\n\n"
+            "📚 Select a subject or type your own topic:",
             reply_markup=_subject_keyboard()
         )
         return
 
     if not setup.get("time_per_q"):
-        await query.edit_message_text("❌ Setup expired. Please run the command again.")
+        await query.edit_message_text(
+            "❌ Setup expired. Start again."
+        )
         return
 
-    # Type a topic (no subject restriction)
     if data == "bsetup_typeany":
         setup["subject"] = None
         setup["await_topic"] = True
+
         await query.edit_message_text(
-            "✍️ Send me the topic now.\n\n"
-            "Examples: Nephrotic syndrome, Beta blockers, Brachial plexus"
+            "✍️ Send your topic.\n\n"
+            "Example: Nephrotic syndrome"
         )
         return
 
-    # Type a topic inside the chosen subject
     if data == "bsetup_typesub":
         setup["await_topic"] = True
+
         await query.edit_message_text(
-            "✍️ Send me the topic in " + str(setup.get("subject")) + " now."
+            f"✍️ Send a topic in {setup['subject']}."
         )
         return
 
-    # Whole chosen subject
     if data == "bsetup_whole":
         context.application.create_task(
-            _battle_setup(context, user, query.message, setup["time_per_q"],
-                          setup.get("subject"), None)
+            _battle_setup(
+                context, user, query.message,
+                setup["time_per_q"],
+                setup["subject"], None
+            )
         )
         return
 
-    # Subject picked (or mixed)
     if data.startswith("bsetup_subj_"):
         key = data.replace("bsetup_subj_", "")
+
         if key == "all":
-            # Gemini can take 20-30 s. Run in the background so other taps aren't blocked.
             context.application.create_task(
-                _battle_setup(context, user, query.message, setup["time_per_q"], None, None)
+                _battle_setup(
+                    context, user, query.message,
+                    setup["time_per_q"], None, None
+                )
             )
             return
+
         try:
             subject = _subject_pool()[int(key)]
         except (ValueError, IndexError):
+            await query.answer("Invalid subject.", show_alert=True)
             return
+
         setup["subject"] = subject
+
         await query.edit_message_text(
-            "📚 Subject: " + subject + "\n\nWhat do you want to battle on?",
+            f"📚 Subject: {subject}\n\nChoose:",
             reply_markup=_subject_action_keyboard()
         )
 
 
-async def battle_topic_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Catches the typed topic. Does nothing unless the user was asked for a topic."""
+async def battle_topic_text_handler(update, context):
     setup = context.user_data.get("battle_setup")
+
     if not setup or not setup.get("await_topic"):
         return
+
     if update.effective_user.id != setup["challenger_id"]:
         return
+
     topic = (update.effective_message.text or "").strip()[:100]
+
     if not topic:
         return
+
     setup["await_topic"] = False
+
     msg = await update.effective_message.reply_text(
-        "🤖 Gemini is writing very high-yield questions on: " + topic + "\n(about 20-30 seconds)"
+        f"🤖 Generating high-yield questions on {topic}..."
     )
+
     context.application.create_task(
-        _battle_setup(context, update.effective_user, msg, setup["time_per_q"],
-                      setup.get("subject"), topic)
+        _battle_setup(
+            context,
+            update.effective_user,
+            msg,
+            setup["time_per_q"],
+            setup.get("subject"),
+            topic
+        )
     )
+
     raise ApplicationHandlerStop
 
 
-async def _battle_setup(context: ContextTypes.DEFAULT_TYPE, user, msg,
-                        time_per_q: int, subject: str | None, topic: str | None):
+async def _battle_setup(
+    context, user, msg, time_per_q, subject, topic
+):
     try:
         setup = context.user_data.get("battle_setup")
 
         if not setup or setup["challenger_id"] != user.id:
-            await msg.edit_text("❌ Setup expired. Please run the command again.")
+            await msg.edit_text("❌ Setup expired.")
             return
 
-        mode = setup["mode"]
         target = setup["target"]
-        target_id = setup["target_id"]
+        target_id = int(setup["target_id"])
+        mode = setup["mode"]
         chat_id = setup["chat_id"]
         challenger_name = setup["challenger_name"]
 
-        if topic:
-            what = topic
-        else:
-            what = subject or "mixed-subject"
         await msg.edit_text(
-            f"🤖 Gemini is writing very high-yield {what} questions…\n(about 20-30 seconds)")
+            "🤖 Gemini is preparing your battle questions..."
+        )
 
         if topic:
-            ai_note = "🤖 Gemini AI · ✍️ " + _md(topic) + (" (" + _md(subject) + ")" if subject else "") + " · very high-yield"
+            ai_note = f"🤖 Gemini AI · {topic}"
         elif subject:
-            ai_note = "🤖 Gemini AI · 📚 " + _md(subject) + " · very high-yield"
+            ai_note = f"🤖 Gemini AI · {subject}"
         else:
-            ai_note = "🤖 Gemini AI · 🎲 mixed subjects · very high-yield"
+            ai_note = "🤖 Gemini AI · Mixed subjects"
 
         try:
-            question_ids = await _gemini_battle_question_ids(subject=subject, topic=topic)
-        except GeminiError as e:
-            logger.warning(f"Battle: Gemini failed, using saved questions: {e}")
+            question_ids = await _gemini_battle_question_ids(
+                subject=subject,
+                topic=topic
+            )
+        except GeminiError:
+            logger.warning("Gemini unavailable.")
             question_ids = []
         except Exception:
-            logger.exception("Battle: Gemini question generation crashed")
+            logger.exception("Question generation failed.")
             question_ids = []
 
         if len(question_ids) < 3:
-            mcqs = await get_mcqs_for_quiz(limit=BATTLE_QUESTIONS)
-            if not mcqs:
-                await msg.edit_text("❌ Could not make questions (Gemini is busy and the database is empty). Try again in a minute.")
-                return
-            question_ids = [m["id"] for m in mcqs]
-            ai_note = "📚 Saved questions (Gemini was busy)"
-            if topic:
-                same = await get_mcqs_for_quiz(subject=subject, topic=topic, limit=BATTLE_QUESTIONS)
-                if len(same) >= 3:
-                    question_ids = [m["id"] for m in same]
-                    ai_note = "📚 Saved questions on " + _md(topic) + " (Gemini was busy)"
-            elif subject:
-                same = await get_mcqs_for_quiz(subject=subject, limit=BATTLE_QUESTIONS)
-                if len(same) >= 3:
-                    question_ids = [m["id"] for m in same]
-                    ai_note = f"📚 Saved {_md(subject)} questions (Gemini was busy)"
+            mcqs = await get_mcqs_for_quiz(
+                subject=subject,
+                topic=topic,
+                limit=BATTLE_QUESTIONS
+            )
 
-        battle_id = f"btl{uuid.uuid4().hex[:6]}"
+            if len(mcqs) < 3:
+                mcqs = await get_mcqs_for_quiz(
+                    limit=BATTLE_QUESTIONS
+                )
+
+            if not mcqs:
+                await msg.edit_text(
+                    "❌ No questions available. Try again later."
+                )
+                return
+
+            question_ids = [m["id"] for m in mcqs]
+            ai_note = "📚 Saved question bank"
+
+        question_ids = question_ids[:BATTLE_QUESTIONS]
+
+        if len(question_ids) < 3:
+            await msg.edit_text(
+                "❌ At least 3 questions are needed."
+            )
+            return
+
+        battle_id = "btl" + uuid.uuid4().hex[:10]
 
         await create_battle({
             "battle_id": battle_id,
             "challenger": user.id,
-            "opponent": 0,
+            "opponent": target_id,
             "chat_id": chat_id,
-            "question_ids": question_ids,
+            "question_ids": question_ids
         })
 
-        await update_battle(battle_id, scores=json.dumps({
+        scores = {
             str(user.id): 0,
+            str(target_id): 0,
             "_challenger_name": challenger_name,
             "_mode": mode,
-            "_time_per_q": time_per_q,
-        }))
+            "_time_per_q": time_per_q
+        }
 
-        context.user_data.pop("battle_setup", None)
+        await update_battle(
+            battle_id,
+            scores=json.dumps(scores)
+        )
 
-        mode_tag = "🔒 DM mode — questions sent privately" if mode == "dm" \
-                   else "👥 Group mode"
         kb = InlineKeyboardMarkup([[
-            InlineKeyboardButton("⚔️ Accept Battle!", callback_data=f"accept_battle_{battle_id}")
+            InlineKeyboardButton(
+                "⚔️ Accept Battle!",
+                callback_data=f"accept_battle_{battle_id}"
+            )
         ]])
 
         invite_text = (
-            f"⚔️ *{challenger_name}* challenges @{target} to a battle!\n\n"
+            f"⚔️ *{_md(challenger_name)}* challenges @{_md(target)}!\n\n"
             f"❓ Questions: {len(question_ids)}\n"
-            f"⏱ Time per question: *{time_per_q}s*\n"
-            f"{ai_note}\n"
-            f"🎮 {mode_tag}\n\n"
-            f"Accept within {BATTLE_INVITE_TIMEOUT} seconds:"
+            f"⏱ Time: {time_per_q}s per question\n"
+            f"{ai_note}\n\n"
+            f"Accept within {BATTLE_INVITE_TIMEOUT} seconds."
         )
 
-        # Send to challenger's chat
-        await msg.edit_text(
-            invite_text, parse_mode="Markdown", reply_markup=kb
-        )
-
-        # Also send directly to opponent's private chat
+        # IMPORTANT: Deliver the private invitation first.
         try:
             await context.bot.send_message(
                 chat_id=target_id,
@@ -403,351 +551,587 @@ async def _battle_setup(context: ContextTypes.DEFAULT_TYPE, user, msg,
                 parse_mode="Markdown",
                 reply_markup=kb
             )
-        except Exception as e:
-            logger.error(f"Could not send battle invite to opponent {target_id}: {e}")
+
+        except TelegramError:
+            logger.exception(
+                "Unable to send invitation to %s", target_id
+            )
+
+            await update_battle(
+                battle_id,
+                status="cancelled"
+            )
+
+            await msg.edit_text(
+                "❌ Telegram could not deliver the invitation.\n\n"
+                "Ask your opponent to open @MedArena121_bot "
+                "and send /start, then try again."
+            )
+            return
+
+        context.user_data.pop("battle_setup", None)
+
+        await msg.edit_text(
+            f"✅ Challenge successfully sent to @{target}!\n\n"
+            f"❓ {len(question_ids)} questions\n"
+            f"⏱ {time_per_q}s per question\n\n"
+            "Waiting for acceptance..."
+        )
+
+        # Expire pending invitations.
+        context.application.create_task(
+            _expire_battle(context, battle_id)
+        )
 
     except Exception as e:
-        logger.error(f"battle_setup error: {e}", exc_info=True)
+        logger.exception("Battle setup failed")
         try:
-            await msg.edit_text(f"❌ Error setting up battle: {e}")
+            await msg.edit_text(f"❌ Battle setup error: {e}")
         except Exception:
             pass
 
 
-async def accept_battle_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def _expire_battle(context, battle_id):
+    await asyncio.sleep(BATTLE_INVITE_TIMEOUT)
+
+    async with _lock(battle_id):
+        battle = await get_battle(battle_id)
+
+        if battle and battle["status"] == "pending":
+            await update_battle(
+                battle_id,
+                status="expired"
+            )
+
+            for uid in (
+                int(battle["challenger"]),
+                int(battle["opponent"])
+            ):
+                try:
+                    await context.bot.send_message(
+                        chat_id=uid,
+                        text="⌛ Battle invitation expired."
+                    )
+                except TelegramError:
+                    pass
+
+
+async def accept_battle_handler(update, context):
     query = update.callback_query
-    await query.answer()
     user = update.effective_user
 
+    await query.answer()
+
+    battle_id = query.data.replace("accept_battle_", "")
+
     try:
-        battle_id = query.data.replace("accept_battle_", "")
+        async with _lock(battle_id):
+            battle = await get_battle(battle_id)
 
-        battle = await get_battle(battle_id)
-        if not battle:
-            await query.answer("❌ Battle not found.", show_alert=True)
-            return
-        if battle["status"] != "pending":
-            await query.answer("❌ Battle already started or expired.", show_alert=True)
-            return
-        if battle["challenger"] == user.id:
-            await query.answer("⚠️ You can't accept your own battle!", show_alert=True)
-            return
+            if not battle:
+                await query.answer(
+                    "Battle not found.",
+                    show_alert=True
+                )
+                return
 
-        existing_scores = json.loads(battle["scores"] or "{}")
-        challenger_name = existing_scores.pop("_challenger_name", "Challenger")
-        mode = existing_scores.pop("_mode", "dm")
-        time_per_q = int(existing_scores.pop("_time_per_q", 30))
-        existing_scores[str(user.id)] = 0
-        existing_scores[str(battle["challenger"])] = existing_scores.get(str(battle["challenger"]), 0)
+            if battle["status"] != "pending":
+                await query.answer(
+                    "Battle is no longer available.",
+                    show_alert=True
+                )
+                return
 
-        await update_battle(battle_id,
-            opponent=user.id, status="active", current_q=0,
-            scores=json.dumps(existing_scores)
-        )
+            # Only the invited opponent may accept.
+            if int(battle["opponent"]) != user.id:
+                await query.answer(
+                    "This invitation is not for you!",
+                    show_alert=True
+                )
+                return
 
-        question_ids = list(battle["question_ids"])
+            scores = _json(battle["scores"])
 
-        started_text = (
-            f"⚔️ *BATTLE STARTED!*\n\n"
-            f"🔵 {challenger_name} vs 🔴 {user.first_name}\n"
-            f"❓ {len(question_ids)} questions | ⏱ {time_per_q}s each\n\n"
-            f"Check your private chat with the bot for questions!"
-        )
-
-        await query.edit_message_text(started_text, parse_mode="Markdown")
-
-        # Notify challenger too
-        try:
-            await context.bot.send_message(
-                chat_id=battle["challenger"],
-                text=started_text,
-                parse_mode="Markdown"
+            challenger_name = scores.get(
+                "_challenger_name", "Challenger"
             )
-        except Exception:
+
+            time_per_q = int(
+                scores.get("_time_per_q", 30)
+            )
+
+            question_ids = list(battle["question_ids"])
+
+            scores[str(user.id)] = 0
+            scores[str(battle["challenger"])] = 0
+
+            await update_battle(
+                battle_id,
+                status="active",
+                current_q=0,
+                scores=json.dumps(scores)
+            )
+
+        # Remove the invitation button.
+        try:
+            await query.edit_message_text(
+                f"⚔️ BATTLE STARTED!\n\n"
+                f"{challenger_name} vs {user.first_name}\n\n"
+                f"❓ {len(question_ids)} questions\n"
+                f"⏱ {time_per_q}s each\n\n"
+                "Check your private chat for questions."
+            )
+        except TelegramError:
             pass
+
+        challenger_id = int(battle["challenger"])
+
+        for uid in (challenger_id, user.id):
+            try:
+                await context.bot.send_message(
+                    chat_id=uid,
+                    text="⚔️ Battle accepted! Get ready..."
+                )
+            except TelegramError:
+                logger.exception(
+                    "Could not notify battle participant %s", uid
+                )
 
         await asyncio.sleep(2)
 
-        await _send_dm_question(context, battle["challenger"], battle_id, 0, question_ids, time_per_q)
-        await _send_dm_question(context, user.id, battle_id, 0, question_ids, time_per_q)
+        # Send the first question to both players.
+        await _send_dm_question(
+            context, challenger_id, battle_id,
+            0, question_ids, time_per_q
+        )
 
-    except Exception as e:
-        logger.error(f"accept_battle_handler error: {e}", exc_info=True)
-        try:
-            await query.edit_message_text(f"❌ Error starting battle: {e}")
-        except Exception:
-            pass
+        await _send_dm_question(
+            context, user.id, battle_id,
+            0, question_ids, time_per_q
+        )
+
+    except Exception:
+        logger.exception("Battle acceptance failed")
 
 
-async def _send_dm_question(context, user_id, battle_id, q_index, question_ids, time_per_q):
+async def _send_dm_question(
+    context, user_id, battle_id, q_index,
+    question_ids, time_per_q
+):
     try:
         mcq_id = question_ids[q_index]
         mcq = await get_mcq_by_id(mcq_id)
+
         if not mcq:
+            logger.error("Missing MCQ %s", mcq_id)
             return
 
-        _battle_q_starts[f"{battle_id}|{q_index}"] = datetime.utcnow().timestamp()
+        key = f"{battle_id}|{q_index}"
+
+        _battle_starts.setdefault(key, time.monotonic())
 
         letters = ["A", "B", "C", "D", "E"]
-        opts = [mcq["option_a"], mcq["option_b"], mcq["option_c"], mcq["option_d"]]
-        if mcq.get("option_e"):
-            opts.append(mcq["option_e"])
 
-        total = len(question_ids)
+        options = [
+            mcq["option_a"],
+            mcq["option_b"],
+            mcq["option_c"],
+            mcq["option_d"]
+        ]
+
+        if mcq["option_e"]:
+            options.append(mcq["option_e"])
+
         text = (
-            f"⚔️ *BATTLE — Q{q_index+1}/{total}*\n"
-            f"⏱ You have *{time_per_q} seconds*"
-            f"{(' · 📚 ' + _md(mcq['subject'])) if mcq.get('subject') else ''}\n\n"
+            f"⚔️ *BATTLE — Q{q_index + 1}/{len(question_ids)}*\n"
+            f"⏱ You have *{time_per_q} seconds*\n\n"
             f"{_md(mcq['question'])}\n\n"
         )
-        for i, opt in enumerate(opts):
-            text += f"*{letters[i]}.* {_md(opt)}\n"
+
+        for i, option in enumerate(options):
+            text += f"*{letters[i]}.* {_md(option)}\n"
 
         kb = InlineKeyboardMarkup([[
             InlineKeyboardButton(
                 letters[i],
-                callback_data=_ans_cb(letters[i], mcq["id"], battle_id, q_index)
+                callback_data=_ans_cb(
+                    letters[i], mcq_id, battle_id, q_index
+                )
             )
-            for i in range(len(opts))
+            for i in range(len(options))
         ]])
 
         await context.bot.send_message(
-            chat_id=user_id, text=text,
-            parse_mode="Markdown", reply_markup=kb
+            chat_id=user_id,
+            text=text,
+            parse_mode="Markdown",
+            reply_markup=kb
         )
 
-        task = asyncio.create_task(
-            _dm_timeout(context, user_id, battle_id, q_index, question_ids, time_per_q)
+        task_key = f"{battle_id}|{q_index}|{user_id}"
+
+        old_task = _battle_tasks.pop(task_key, None)
+
+        if old_task:
+            old_task.cancel()
+
+        _battle_tasks[task_key] = asyncio.create_task(
+            _dm_timeout(
+                context, user_id, battle_id,
+                q_index, question_ids, time_per_q
+            )
         )
-        _countdown_tasks[f"{battle_id}|{q_index}|{user_id}"] = task
-    except Exception as e:
-        logger.error(f"_send_dm_question error for {user_id}: {e}", exc_info=True)
+
+    except TelegramError:
+        logger.exception(
+            "Could not send question to player %s", user_id
+        )
 
 
-async def _dm_timeout(context, user_id, battle_id, q_index, question_ids, time_per_q):
+async def _dm_timeout(
+    context, user_id, battle_id,
+    q_index, question_ids, time_per_q
+):
     await asyncio.sleep(time_per_q)
+
     try:
+        await _submit_answer(
+            context,
+            user_id,
+            battle_id,
+            q_index,
+            None,
+            question_ids[q_index],
+            timed_out=True
+        )
+
+    except Exception:
+        logger.exception("Battle timeout failed")
+
+
+async def _submit_answer(
+    context, user_id, battle_id, q_index,
+    chosen, mcq_id, timed_out=False
+):
+    advance = False
+    time_per_q = 30
+    question_ids = []
+
+    async with _lock(battle_id):
         battle = await get_battle(battle_id)
+
+        if not battle or battle["status"] != "active":
+            return False
+
+        if int(battle["current_q"]) != q_index:
+            return False
+
+        if user_id not in (
+            int(battle["challenger"]),
+            int(battle["opponent"])
+        ):
+            return False
+
+        answer_times = _json(battle["answer_times"])
+        player_key = f"{q_index}_{user_id}"
+
+        if player_key in answer_times:
+            return False
+
+        if int(battle["question_ids"][q_index]) != int(mcq_id):
+            return False
+
+        mcq = await get_mcq_by_id(mcq_id)
+
+        if not mcq:
+            return False
+
+        elapsed = time.monotonic() - _battle_starts.get(
+            f"{battle_id}|{q_index}", time.monotonic()
+        )
+
+        elapsed = min(elapsed, 999)
+
+        correct = (
+            not timed_out and chosen == mcq["correct"]
+        )
+
+        xp = XP_CORRECT if correct else XP_WRONG
+
+        if correct and elapsed <= BATTLE_BONUS_SPEED_SECONDS:
+            xp += XP_SPEED_BONUS
+
+        answer_times[player_key] = {
+            "chosen": chosen or "-",
+            "correct": correct,
+            "time": round(elapsed, 2),
+            "xp": xp
+        }
+
+        scores = _json(battle["scores"])
+
+        scores[str(user_id)] = (
+            scores.get(str(user_id), 0) + max(xp, 0)
+        )
+
+        await update_battle(
+            battle_id,
+            answer_times=json.dumps(answer_times),
+            scores=json.dumps(scores)
+        )
+
+        other_id = (
+            int(battle["opponent"])
+            if user_id == int(battle["challenger"])
+            else int(battle["challenger"])
+        )
+
+        other_key = f"{q_index}_{other_id}"
+
+        advance = other_key in answer_times
+
+        question_ids = list(battle["question_ids"])
+        time_per_q = int(scores.get("_time_per_q", 30))
+
+        # Record XP and answer outside the lock.
+        try:
+            await record_answer(
+                user_id,
+                mcq_id,
+                chosen or "-",
+                correct,
+                elapsed,
+                battle_id
+            )
+            await add_xp(user_id, xp)
+        except Exception:
+            logger.exception("Could not record battle XP")
+
+    # Tell the player their result.
+    if timed_out:
+        result = (
+            f"⏰ *Time's up!* Q{q_index + 1}\n"
+            "No answer recorded."
+        )
+    else:
+        icon = "✅" if correct else "❌"
+
+        correct_text = {
+            "A": mcq["option_a"],
+            "B": mcq["option_b"],
+            "C": mcq["option_c"],
+            "D": mcq["option_d"],
+            "E": mcq["option_e"]
+        }.get(mcq["correct"], mcq["correct"])
+
+        result = (
+            f"{icon} *{'Correct!' if correct else 'Wrong!'}*\n"
+            f"Your answer: *{chosen}*\n"
+            f"Correct: *{mcq['correct']}* — {_md(correct_text)}\n"
+            f"⏱ {elapsed:.1f}s | ⚡ XP: {xp}\n"
+        )
+
+        if mcq.get("explanation"):
+            result += "\n💡 " + _md(mcq["explanation"])
+
+        result += "\n\n⏳ Waiting for opponent..."
+
+    try:
+        await context.bot.send_message(
+            chat_id=user_id,
+            text=result,
+            parse_mode="Markdown"
+        )
+    except TelegramError:
+        logger.exception("Could not send answer result")
+
+    if advance:
+        await _advance_battle(
+            context, battle_id, q_index,
+            question_ids, time_per_q
+        )
+
+    return True
+
+
+async def _advance_battle(
+    context, battle_id, q_index,
+    question_ids, time_per_q
+):
+    next_q = None
+    finish = False
+
+    async with _lock(battle_id):
+        battle = await get_battle(battle_id)
+
         if not battle or battle["status"] != "active":
             return
 
-        # Stale timeout: the battle has already moved past this question
-        # (both players answered earlier and it was already advanced).
-        if int(battle.get("current_q", q_index)) != q_index:
+        if int(battle["current_q"]) != q_index:
             return
 
-        answer_times = json.loads(battle.get("answer_times") or "{}")
-        player_key = f"{q_index}_{user_id}"
+        answers = _json(battle["answer_times"])
 
-        if player_key not in answer_times:
-            answer_times[player_key] = {
-                "chosen": "-", "correct": False,
-                "time": time_per_q, "xp": XP_WRONG
-            }
-            await update_battle(battle_id, answer_times=json.dumps(answer_times))
-            try:
-                await context.bot.send_message(
-                    chat_id=user_id,
-                    text=f"⏰ *Time's up!* Q{q_index+1} — No answer recorded.",
-                    parse_mode="Markdown"
-                )
-            except Exception:
-                pass
+        p1 = f"{q_index}_{battle['challenger']}"
+        p2 = f"{q_index}_{battle['opponent']}"
 
-        other_id = battle["opponent"] if user_id == battle["challenger"] else battle["challenger"]
-        other_key = f"{q_index}_{other_id}"
-        fresh = await get_battle(battle_id)
-        fresh_times = json.loads(fresh.get("answer_times") or "{}")
+        if p1 not in answers or p2 not in answers:
+            return
 
-        if other_key in fresh_times:
-            await asyncio.sleep(1)
-            await _advance_battle(context, battle_id, q_index, question_ids, time_per_q)
-    except Exception as e:
-        logger.error(f"_dm_timeout error: {e}", exc_info=True)
+        next_q = q_index + 1
 
+        if next_q >= len(question_ids):
+            await update_battle(
+                battle_id,
+                current_q=next_q,
+                status="finished"
+            )
+            finish = True
+        else:
+            await update_battle(
+                battle_id,
+                current_q=next_q
+            )
 
-async def _advance_battle(context, battle_id, q_index, question_ids, time_per_q):
-    """Move the battle on to the next question (or finish it).
+    # Cancel old timers.
+    for uid in (
+        int(battle["challenger"]),
+        int(battle["opponent"])
+    ):
+        task = _battle_tasks.pop(
+            f"{battle_id}|{q_index}|{uid}", None
+        )
+        if task and not task.done():
+            task.cancel()
 
-    Guarded by `current_q` so that if both _handle_battle_answer and a
-    _dm_timeout race to advance the same question, only the first one
-    actually sends the next question / finishes the battle.
-    """
-    battle = await get_battle(battle_id)
-    if not battle or battle["status"] != "active":
-        return
-    if int(battle.get("current_q", q_index)) != q_index:
-        return  # already advanced by the other path
+    await asyncio.sleep(1)
 
-    next_q = q_index + 1
-    await update_battle(battle_id, current_q=next_q)
-
-    if next_q < len(question_ids):
-        await _send_dm_question(context, battle["challenger"], battle_id,
-                                next_q, question_ids, time_per_q)
-        await _send_dm_question(context, battle["opponent"], battle_id,
-                                next_q, question_ids, time_per_q)
-    else:
+    if finish:
         await _finish_battle(context, battle_id)
-
-
-async def battle_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    data = query.data
-    if data == "battle_menu":
-        await battle_handler(update, context)
-        return
-    if data.startswith("ba|"):
-        await _handle_battle_answer(update, context)
         return
 
+    _battle_starts[f"{battle_id}|{next_q}"] = time.monotonic()
 
-async def _handle_battle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _send_dm_question(
+        context, int(battle["challenger"]),
+        battle_id, next_q, question_ids, time_per_q
+    )
+
+    await _send_dm_question(
+        context, int(battle["opponent"]),
+        battle_id, next_q, question_ids, time_per_q
+    )
+
+
+async def _handle_battle_answer(update, context):
     query = update.callback_query
     user = update.effective_user
 
     try:
-        chosen, mcq_id, battle_id, q_index = _parse_ans_cb(query.data)
-    except Exception as e:
-        logger.error(f"Bad battle callback: {query.data} — {e}")
-        await query.answer("❌ Error processing answer.", show_alert=True)
-        return
-
-    try:
-        battle = await get_battle(battle_id)
-        if not battle:
-            await query.answer("Battle not found.")
-            return
-        if user.id not in [battle["challenger"], battle["opponent"]]:
-            await query.answer("⚠️ You're not in this battle!", show_alert=True)
-            return
-
-        answer_times = json.loads(battle.get("answer_times") or "{}")
-        player_key = f"{q_index}_{user.id}"
-        if player_key in answer_times:
-            await query.answer("⚠️ Already answered!", show_alert=True)
-            return
-
-        mcq = await get_mcq_by_id(mcq_id)
-        if not mcq:
-            await query.answer("Question not found.")
-            return
-
-        is_correct = (chosen == mcq["correct"])
-        start_time = _battle_q_starts.get(f"{battle_id}|{q_index}", datetime.utcnow().timestamp())
-        time_taken = datetime.utcnow().timestamp() - start_time
-
-        xp = XP_CORRECT if is_correct else XP_WRONG
-        if is_correct and time_taken <= BATTLE_BONUS_SPEED_SECONDS:
-            xp += XP_SPEED_BONUS
-
-        try:
-            await record_answer(user.id, mcq_id, chosen, is_correct, time_taken, battle_id)
-            await add_xp(user.id, xp)
-        except Exception as e:
-            logger.error(f"record_answer error: {e}")
-
-        answer_times[player_key] = {
-            "chosen": chosen, "correct": is_correct,
-            "time": round(time_taken, 2), "xp": xp
-        }
-        await update_battle(battle_id, answer_times=json.dumps(answer_times))
-
-        scores = json.loads(battle["scores"] or "{}")
-        uid_str = str(user.id)
-        scores[uid_str] = scores.get(uid_str, 0) + (xp if xp > 0 else 0)
-        await update_battle(battle_id, scores=json.dumps(scores))
-
-        icon = "✅" if is_correct else "❌"
-        speed_tag = "⚡ Speed bonus! " if is_correct and time_taken <= BATTLE_BONUS_SPEED_SECONDS else ""
-        correct_text = {
-            "A": mcq["option_a"], "B": mcq["option_b"],
-            "C": mcq["option_c"], "D": mcq["option_d"]
-        }.get(mcq["correct"], mcq["correct"])
-
-        result_msg = (
-            f"{icon} *{'Correct!' if is_correct else 'Wrong!'}* {speed_tag}\n"
-            f"Your answer: *{chosen}* | Correct: *{mcq['correct']}* — {_md(correct_text)}\n"
-            f"⏱ {time_taken:.1f}s | ⚡ XP: {'+' if xp >= 0 else ''}{xp}\n"
-            + (f"\n💡 {_md(mcq['explanation'])}\n" if mcq.get("explanation") else "")
-            + "\n⏳ Waiting for opponent..."
+        chosen, mcq_id, battle_id, q_index = _parse_ans_cb(
+            query.data
         )
 
+        await query.answer()
+
+        success = await _submit_answer(
+            context,
+            user.id,
+            battle_id,
+            q_index,
+            chosen,
+            mcq_id
+        )
+
+        if not success:
+            await query.answer(
+                "Already answered, expired, or invalid question.",
+                show_alert=True
+            )
+
+    except Exception:
+        logger.exception("Battle answer handler failed")
         try:
-            await query.edit_message_text(result_msg, parse_mode="Markdown")
-        except Exception:
-            await query.answer(f"{icon} {'Correct' if is_correct else 'Wrong'}! ({time_taken:.1f}s)")
-
-        other_id = battle["opponent"] if user.id == battle["challenger"] else battle["challenger"]
-        other_key = f"{q_index}_{other_id}"
-        fresh_battle = await get_battle(battle_id)
-        fresh_times = json.loads(fresh_battle.get("answer_times") or "{}")
-        both_answered = (player_key in fresh_times) and (other_key in fresh_times)
-
-        if both_answered:
-            question_ids = list(battle["question_ids"])
-
-            for uid in (battle["challenger"], battle["opponent"]):
-                task = _countdown_tasks.pop(f"{battle_id}|{q_index}|{uid}", None)
-                if task:
-                    task.cancel()
-
-            fresh2 = await get_battle(battle_id)
-            sc = json.loads(fresh2["scores"] or "{}")
-            time_per_q = int(sc.get("_time_per_q", 30))
-
-            await asyncio.sleep(2)
-            await _advance_battle(context, battle_id, q_index, question_ids, time_per_q)
-
-    except Exception as e:
-        logger.error(f"_handle_battle_answer error: {e}", exc_info=True)
-        try:
-            await query.answer(f"❌ Error: {e}", show_alert=True)
+            await query.answer(
+                "Error processing answer.",
+                show_alert=True
+            )
         except Exception:
             pass
 
 
+async def battle_callback_handler(update, context):
+    query = update.callback_query
+
+    if query.data == "battle_menu":
+        await battle_handler(update, context)
+        return
+
+    if query.data.startswith("ba|"):
+        await _handle_battle_answer(update, context)
+
+
 async def _finish_battle(context, battle_id):
     try:
-        await update_battle(battle_id, status="finished")
         battle = await get_battle(battle_id)
 
-        scores = json.loads(battle["scores"] or "{}")
-        p1_id = str(battle["challenger"])
-        p2_id = str(battle["opponent"])
-        p1_score = scores.get(p1_id, 0)
-        p2_score = scores.get(p2_id, 0)
+        if not battle:
+            return
+
+        scores = _json(battle["scores"])
+
+        p1_id = int(battle["challenger"])
+        p2_id = int(battle["opponent"])
+
+        p1_score = scores.get(str(p1_id), 0)
+        p2_score = scores.get(str(p2_id), 0)
 
         try:
-            p1_name = (await context.bot.get_chat(int(p1_id))).first_name or "Player 1"
+            p1_name = (
+                await context.bot.get_chat(p1_id)
+            ).first_name or "Player 1"
         except Exception:
             p1_name = "Player 1"
+
         try:
-            p2_name = (await context.bot.get_chat(int(p2_id))).first_name or "Player 2"
+            p2_name = (
+                await context.bot.get_chat(p2_id)
+            ).first_name or "Player 2"
         except Exception:
             p2_name = "Player 2"
 
         if p1_score > p2_score:
-            winner = f"🏆 *{p1_name}* wins!"
+            winner = f"🏆 *{_md(p1_name)} wins!*"
         elif p2_score > p1_score:
-            winner = f"🏆 *{p2_name}* wins!"
+            winner = f"🏆 *{_md(p2_name)} wins!*"
         else:
-            winner = "🤝 It's a *draw*!"
+            winner = "🤝 *It's a draw!*"
 
         result = (
-            f"⚔️ *BATTLE RESULTS*\n\n"
-            f"🔵 {p1_name}: *{p1_score} pts*\n"
-            f"🔴 {p2_name}: *{p2_score} pts*\n\n"
+            "⚔️ *BATTLE RESULTS*\n\n"
+            f"🔵 {_md(p1_name)}: *{p1_score} pts*\n"
+            f"🔴 {_md(p2_name)}: *{p2_score} pts*\n\n"
             f"{winner}"
         )
 
-        for uid in [int(p1_id), int(p2_id)]:
+        for uid in (p1_id, p2_id):
             try:
                 await context.bot.send_message(
-                    chat_id=uid, text=result, parse_mode="Markdown"
+                    chat_id=uid,
+                    text=result,
+                    parse_mode="Markdown"
                 )
-            except Exception as e:
-                logger.error(f"DM result error for {uid}: {e}")
+            except TelegramError:
+                logger.exception(
+                    "Could not send final result to %s", uid
+                )
 
-    except Exception as e:
-        logger.error(f"_finish_battle error: {e}", exc_info=True)
+        # Clean up in-memory state.
+        for key in list(_battle_starts):
+            if key.startswith(battle_id + "|"):
+                _battle_starts.pop(key, None)
+
+        _battle_locks.pop(battle_id, None)
+
+    except Exception:
+        logger.exception("Battle finalization failed")
