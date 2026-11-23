@@ -295,4 +295,3 @@ def schedule_auto(app: Application) -> None:
         return
     app.job_queue.run_repeating(auto_job, interval=AUTO_INTERVAL_MIN * 60, first=60, name="auto_mcq")
     logger.info(f"Auto drafts scheduled every {AUTO_INTERVAL_MIN} min (start {'ON' if AUTO_START_ON else 'OFF'})")
-j
