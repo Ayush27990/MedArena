@@ -98,56 +98,76 @@ async def generate_mcqs(topic: str, count: int = 5) -> tuple[list[dict], int]:
     """
     Ask Gemini for `count` MCQs on `topic`.
     Returns (mcqs, dropped) where dropped = how many Gemini items were unusable.
+    Retries when Gemini is busy, then tries GEMINI_FALLBACK_MODEL if you set one.
     Raises GeminiError with a readable message on failure.
     """
     if not GEMINI_API_KEY:
         raise GeminiError("GEMINI_API_KEY is not set on the host. Add it in the environment variables and restart.")
 
-    url = GEMINI_URL.format(model=GEMINI_MODEL)
+    models = [GEMINI_MODEL]
+    fallback = os.getenv("GEMINI_FALLBACK_MODEL", "").strip()
+    if fallback and fallback != GEMINI_MODEL:
+        models.append(fallback)
+
     headers = {"x-goog-api-key": GEMINI_API_KEY, "Content-Type": "application/json"}
     payload = {
         "contents": [{"parts": [{"text": _build_prompt(topic, count)}]}],
         "generationConfig": {"temperature": 0.6},
     }
+    waits = [3, 6, 12]          # pause before retry 2, 3, 4 (per model)
+    last_error = "Gemini is busy right now. Please try again in a few minutes."
 
-    last_error = "unknown error"
-    for attempt in range(3):
-        try:
-            async with httpx.AsyncClient(timeout=90) as client:
-                r = await client.post(url, headers=headers, json=payload)
-            if r.status_code in (429, 500, 503) and attempt < 2:
-                await asyncio.sleep(2 ** (attempt + 1))
-                continue
+    for model in models:
+        url = GEMINI_URL.format(model=model)
+        for attempt in range(len(waits) + 1):
+            try:
+                async with httpx.AsyncClient(timeout=90) as client:
+                    r = await client.post(url, headers=headers, json=payload)
+            except httpx.HTTPError as e:
+                logger.error(f"Gemini network error ({model}, try {attempt + 1}): {type(e).__name__}: {e}")
+                last_error = "Could not reach Gemini. Please try again."
+                if attempt < len(waits):
+                    await asyncio.sleep(waits[attempt])
+                    continue
+                break  # next model
+
+            if r.status_code in (429, 500, 502, 503, 504):
+                logger.warning(f"Gemini busy ({model}, try {attempt + 1}): HTTP {r.status_code}")
+                last_error = ("Gemini rate limit reached. Try again in a minute." if r.status_code == 429
+                              else "Gemini is busy right now. Please try again in a few minutes.")
+                if attempt < len(waits):
+                    await asyncio.sleep(waits[attempt])
+                    continue
+                break  # next model
+
             if r.status_code != 200:
-                logger.error(f"Gemini HTTP {r.status_code}: {r.text[:500]}")
-                if r.status_code in (400, 403):
-                    last_error = "Gemini rejected the request (check GEMINI_API_KEY and GEMINI_MODEL)."
-                elif r.status_code == 404:
+                logger.error(f"Gemini HTTP {r.status_code} ({model}): {r.text[:500]}")
+                if r.status_code == 404:
                     last_error = "Gemini model not found. Set GEMINI_MODEL to a model that exists in your account."
-                elif r.status_code == 429:
-                    last_error = "Gemini rate limit reached. Try again in a minute."
+                elif r.status_code in (400, 401, 403):
+                    last_error = "Gemini rejected the request (check GEMINI_API_KEY and GEMINI_MODEL)."
                 else:
                     last_error = f"Gemini error {r.status_code}."
-                raise GeminiError(last_error)
+                break  # next model (a fallback may still work)
 
-            body = r.json()
-            parts = body["candidates"][0]["content"]["parts"]
-            text = "".join(p.get("text", "") for p in parts)
-            items = _extract_json_array(text)
+            try:
+                parts = r.json()["candidates"][0]["content"]["parts"]
+                text = "".join(p.get("text", "") for p in parts)
+                items = _extract_json_array(text)
+            except (KeyError, IndexError, ValueError, TypeError) as e:
+                logger.error(f"Gemini bad response ({model}): {type(e).__name__}: {e}")
+                last_error = "Gemini returned an empty or blocked answer. Try a different topic."
+                break
+            except GeminiError as e:
+                last_error = str(e)
+                if attempt < len(waits):
+                    await asyncio.sleep(2)
+                    continue
+                break
             good, dropped = _clean_mcqs(items)
-            if not good:
-                raise GeminiError("Gemini's questions were not usable. Please try again.")
-            return good, dropped
-        except GeminiError:
-            raise
-        except (KeyError, IndexError, ValueError) as e:
-            logger.error(f"Gemini bad response shape: {e}")
-            last_error = "Gemini returned an empty or blocked answer. Try a different topic."
+            if good:
+                return good, dropped
+            last_error = "Gemini's questions were not usable. Please try again."
             break
-        except httpx.HTTPError as e:
-            logger.error(f"Gemini network error: {e}")
-            last_error = "Could not reach Gemini. Please try again."
-            if attempt < 2:
-                await asyncio.sleep(2)
-                continue
+
     raise GeminiError(last_error)
