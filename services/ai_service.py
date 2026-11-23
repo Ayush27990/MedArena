@@ -4,6 +4,8 @@ Handles MCQ categorization, explanation generation, and text parsing
 """
 
 import json
+import os
+import re
 import logging
 import asyncio
 import httpx
@@ -11,6 +13,7 @@ from config import GROQ_API_KEY, GROQ_MODEL_FAST, GROQ_MODEL_SMART, SUBJECTS, DI
 
 logger = logging.getLogger(__name__)
 
+GROQ_VISION_MODEL = os.getenv("GROQ_VISION_MODEL", "qwen/qwen3.8-27b")
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 HEADERS = {
     "Authorization": f"Bearer {GROQ_API_KEY}",
@@ -150,12 +153,11 @@ async def parse_pdf_text(text: str) -> list[dict]:
 
 async def ocr_image_to_mcqs(image_base64: str) -> list[dict]:
     """
-    Use Groq vision-capable model to extract MCQs from image.
-    Falls back to text extraction prompt if vision not available.
+    Use a Groq vision model to extract MCQs from an image.
+    Model can be changed with the GROQ_VISION_MODEL env var (no code edit needed).
     """
-    # Note: Use llama-3.2-90b-vision-preview for image support
     payload = {
-        "model": "llama-3.2-11b-vision-preview",
+        "model": GROQ_VISION_MODEL,
         "messages": [{
             "role": "user",
             "content": [
@@ -173,16 +175,26 @@ Respond with ONLY the JSON array."""
                 }
             ]
         }],
-        "max_tokens": 1500,
+        "max_tokens": 2000,
         "temperature": 0.2,
     }
     try:
-        async with httpx.AsyncClient(timeout=40) as client:
+        async with httpx.AsyncClient(timeout=60) as client:
             r = await client.post(GROQ_URL, headers=HEADERS, json=payload)
             r.raise_for_status()
             raw = r.json()["choices"][0]["message"]["content"].strip()
-            raw = raw.replace("```json", "").replace("```", "").strip()
-            return json.loads(raw)
+        # Remove any <think>...</think> block and code fences
+        raw = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL)
+        raw = raw.replace("```json", "").replace("```", "").strip()
+        # Keep only the JSON array part
+        a, b = raw.find("["), raw.rfind("]")
+        if a == -1 or b == -1:
+            logger.error(f"OCR: no JSON array in reply: {raw[:300]}")
+            return []
+        return json.loads(raw[a:b + 1])
+    except httpx.HTTPStatusError as e:
+        logger.error(f"OCR HTTP {e.response.status_code}: {e.response.text[:500]}")
+        return []
     except Exception as e:
         logger.error(f"OCR error: {e}")
         return []
