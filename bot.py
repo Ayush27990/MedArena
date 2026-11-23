@@ -25,10 +25,11 @@ from handlers.admin import (
 )
 from handlers.search import search_handler, search_callback_handler, handle_search_text
 from handlers.import_mcq import handle_explanation_text
+from handlers.generate import generate_handler, generate_callback_handler
 from services.database import init_db
 
 logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)tz",
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
@@ -86,6 +87,9 @@ def main():
     # Search
     app.add_handler(CommandHandler("search", search_handler))
 
+    # AI MCQ generator (admin approval before posting to groups)
+    app.add_handler(CommandHandler("generate", generate_handler))
+
     # Admin
     app.add_handler(CommandHandler("admin", admin_handler))
     app.add_handler(CommandHandler("pending", pending_approval_handler))
@@ -114,6 +118,7 @@ def main():
     app.add_handler(CallbackQueryHandler(revision_callback_handler, pattern=r'^rev_'))
     app.add_handler(CallbackQueryHandler(admin_callback_handler, pattern=r'^adm_'))
     app.add_handler(CallbackQueryHandler(search_callback_handler, pattern=r'^srch_'))
+    app.add_handler(CallbackQueryHandler(generate_callback_handler, pattern=r'^gen_'))
 
     logger.info("MedQuiz Master Bot starting...")
     app.run_polling(drop_pending_updates=True)
