@@ -3,12 +3,12 @@ Automatic MCQ drafts (every 15 minutes by default).
 
 Every AUTO_INTERVAL_MIN minutes the bot asks Gemini for ONE exam-level MCQ,
 rotating through the subjects and alternating NEET PG / USMLE level, and sends
-it to the admin's private chat with buttons.
+it to the admin's private chat with one button per group.
 
-Nothing is posted anywhere until the admin taps "Send to group". Tapping it
-reuses the existing /generate flow (handlers/generate.py): the MCQ is posted
-as a quiz poll to TARGET_CHAT_IDS and saved (approved) in the database for
-future quizzes. "Skip" discards the draft and saves nothing.
+Nothing is posted anywhere until the admin taps a group button (or "All groups").
+The MCQ is then posted as a quiz poll to the chosen group(s) and saved
+(approved) in the database for future quizzes. "Skip" discards the draft and
+saves nothing.
 
 Admin command (private chat):
   /auto            status
@@ -30,12 +30,12 @@ import uuid
 import random
 import logging
 from collections import deque
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, ContextTypes
 from config import ADMIN_IDS, SUBJECTS
 from services.gemini_service import generate_mcqs, GeminiError
 from services.database import search_mcqs
-from handlers.generate import _drafts, _preview_text, _buttons, _target_chats
+from handlers.generate import _drafts, _preview_text, _target_chats, _post_to_groups, _clear_buttons
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +69,17 @@ def _admin_id() -> int | None:
     if raw.lstrip("-").isdigit():
         return int(raw)
     return ADMIN_IDS[0] if ADMIN_IDS else None
+
+
+def _auto_buttons(batch: str, data: dict) -> InlineKeyboardMarkup:
+    rows = []
+    for i, cid in enumerate(data["targets"]):
+        rows.append([InlineKeyboardButton(f"✅ Send to {data['titles'].get(cid, cid)}"[:60],
+                                          callback_data=f"agen|{batch}|{i}")])
+    if len(data["targets"]) > 1:
+        rows.append([InlineKeyboardButton("✅ Send to ALL groups", callback_data=f"agen|{batch}|all")])
+    rows.append([InlineKeyboardButton("🗑 Skip", callback_data=f"gen_no|{batch}|0")])
+    return InlineKeyboardMarkup(rows)
 
 
 def _state(context: ContextTypes.DEFAULT_TYPE) -> dict:
@@ -161,22 +172,66 @@ async def make_auto_draft(context: ContextTypes.DEFAULT_TYPE, force: bool = Fals
     data = {
         "admin": admin_id, "chat_id": admin_id, "topic": subject,
         "items": [{"mcq": mcq, "status": None, "msg_id": None}],
-        "targets": targets, "titles": titles, "selected": set(targets),
+        "targets": targets, "titles": titles, "selected": set(),
         "auto": True, "created": time.time(),
     }
     _drafts(context)[batch] = data
 
-    header = (f"⏰ Auto draft · {subject} · {level}\n"
-              f"📍 Will post to: {', '.join(titles.values())}\n\n")
+    header = f"⏰ Auto draft · {subject} · {level}\n👇 Tap the group to send it to\n\n"
     try:
         sent = await context.bot.send_message(
-            admin_id, header + _preview_text(0, 1, mcq), reply_markup=_buttons(batch, 0))
+            admin_id, header + _preview_text(0, 1, mcq), reply_markup=_auto_buttons(batch, data))
     except Exception as e:
         _drafts(context).pop(batch, None)
         logger.error(f"Could not DM the admin {admin_id}: {e}")
         return "Could not message the admin. Open the bot in Telegram and press Start first."
     data["items"][0]["msg_id"] = sent.message_id
     return "ok"
+
+
+async def auto_send_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin tapped a group button on an auto draft: post there and save to the database."""
+    q = update.callback_query
+    if not q or not q.data:
+        return
+    if q.from_user.id not in ADMIN_IDS:
+        await q.answer("Admins only.", show_alert=True)
+        return
+    parts = q.data.split("|")
+    if len(parts) != 3:
+        await q.answer()
+        return
+    _, batch, which = parts
+    data = _drafts(context).get(batch)
+    if not data:
+        await q.answer("This draft expired (the bot restarted). Wait for the next one.", show_alert=True)
+        try:
+            await q.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        return
+    item = data["items"][0]
+    if item["status"]:
+        await q.answer("Already handled.")
+        return
+    try:
+        chats = list(data["targets"]) if which == "all" else [data["targets"][int(which)]]
+    except (ValueError, IndexError):
+        await q.answer()
+        return
+
+    await q.answer("Sending…")
+    ok, failed = await _post_to_groups(context, item["mcq"], q.from_user.id, chats)
+    if ok:
+        item["status"] = "sent"
+        names = ", ".join(str(data["titles"].get(c, c)) for c in chats if c not in failed)
+        tail = f"\n\n✅ Sent to {names}"
+        if failed:
+            tail += f"\n⚠️ Could not post to: {', '.join(map(str, failed))} (is the bot an admin there?)"
+        await _clear_buttons(context, data["chat_id"], item["msg_id"], _preview_text(0, 1, item["mcq"]) + tail)
+    else:
+        await context.bot.send_message(
+            data["chat_id"], "⚠️ Could not post. Make sure the bot is in the group and allowed to post polls, then tap again.")
 
 
 async def _record_failure(context, state: dict, admin_id: int, reason: str) -> str:
@@ -240,3 +295,4 @@ def schedule_auto(app: Application) -> None:
         return
     app.job_queue.run_repeating(auto_job, interval=AUTO_INTERVAL_MIN * 60, first=60, name="auto_mcq")
     logger.info(f"Auto drafts scheduled every {AUTO_INTERVAL_MIN} min (start {'ON' if AUTO_START_ON else 'OFF'})")
+j
