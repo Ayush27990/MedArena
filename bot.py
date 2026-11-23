@@ -26,7 +26,7 @@ from handlers.admin import (
 from handlers.search import search_handler, search_callback_handler, handle_search_text
 from handlers.import_mcq import handle_explanation_text
 from handlers.generate import generate_handler, generate_callback_handler
-from handlers.auto_generate import auto_handler, schedule_auto
+from handlers.auto_generate import auto_handler, auto_send_callback, schedule_auto
 from services.database import init_db
 
 logging.basicConfig(
@@ -123,6 +123,7 @@ def main():
     app.add_handler(CallbackQueryHandler(admin_callback_handler, pattern=r'^adm_'))
     app.add_handler(CallbackQueryHandler(search_callback_handler, pattern=r'^srch_'))
     app.add_handler(CallbackQueryHandler(generate_callback_handler, pattern=r'^gen_'))
+    app.add_handler(CallbackQueryHandler(auto_send_callback, pattern=r'^agen\|'))
 
     logger.info("MedQuiz Master Bot starting...")
     app.run_polling(drop_pending_updates=True)
