@@ -26,6 +26,7 @@ from handlers.admin import (
 from handlers.search import search_handler, search_callback_handler, handle_search_text
 from handlers.import_mcq import handle_explanation_text
 from handlers.generate import generate_handler, generate_callback_handler
+from handlers.auto_generate import auto_handler, schedule_auto
 from services.database import init_db
 
 logging.basicConfig(
@@ -89,6 +90,9 @@ def main():
 
     # AI MCQ generator (admin approval before posting to groups)
     app.add_handler(CommandHandler("generate", generate_handler))
+    # Auto drafts every 15 min, sent to the admin for approval
+    app.add_handler(CommandHandler("auto", auto_handler))
+    schedule_auto(app)
 
     # Admin
     app.add_handler(CommandHandler("admin", admin_handler))
