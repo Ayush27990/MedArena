@@ -4,6 +4,7 @@ Battle Mode Handler — 1v1 real-time MCQ battles
 
 import json
 import uuid
+import random
 import asyncio
 import logging
 from datetime import datetime
@@ -11,11 +12,14 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
 from services.database import (
     get_mcqs_for_quiz, create_battle, get_battle, update_battle,
-    get_mcq_by_id, record_answer, add_xp, get_user_by_username
+    get_mcq_by_id, record_answer, add_xp, get_user_by_username,
+    insert_mcq, get_mcq_id_by_hash, search_mcqs
 )
+from services.gemini_service import generate_mcqs, GeminiError
+from handlers.import_mcq import _make_hash
 from config import (
     BATTLE_INVITE_TIMEOUT, XP_CORRECT,
-    XP_SPEED_BONUS, BATTLE_BONUS_SPEED_SECONDS, XP_WRONG
+    XP_SPEED_BONUS, BATTLE_BONUS_SPEED_SECONDS, XP_WRONG, SUBJECTS
 )
 
 logger = logging.getLogger(__name__)
@@ -24,6 +28,70 @@ _battle_q_starts: dict = {}
 _countdown_tasks: dict = {}
 
 TIMER_OPTIONS = [15, 20, 30, 45, 60]
+BATTLE_QUESTIONS = 10
+BATTLE_EXPLANATION_CHARS = 400
+
+
+def _md(text) -> str:
+    """Escape Telegram legacy-Markdown characters so AI text can't break a message."""
+    out = str(text or "")
+    for ch in ("\\", "_", "*", "`", "["):
+        out = out.replace(ch, "\\" + ch)
+    return out
+
+
+def _subject_pool() -> list[str]:
+    return [x for x in SUBJECTS if x != "Other"]
+
+
+def _subject_keyboard() -> InlineKeyboardMarkup:
+    pool = _subject_pool()
+    rows = [[InlineKeyboardButton("🎲 Mixed (all subjects)", callback_data="bsetup_subj_all")]]
+    for i in range(0, len(pool), 2):
+        rows.append([
+            InlineKeyboardButton(pool[j][:24], callback_data=f"bsetup_subj_{j}")
+            for j in range(i, min(i + 2, len(pool)))
+        ])
+    return InlineKeyboardMarkup(rows)
+
+
+async def _gemini_battle_question_ids(count: int = BATTLE_QUESTIONS, subject: str | None = None) -> list[int]:
+    """Ask Gemini for very high-yield MCQs, save them (approved, so they join the question
+    bank) and return their database ids. subject=None -> mixed: one question from each of
+    `count` different subjects. subject="X" -> `count` different questions all on X."""
+    pool = _subject_pool()
+    if subject:
+        try:
+            avoid = [r["question"] for r in await search_mcqs(subject=subject, limit=25)]
+        except Exception:
+            avoid = []
+        mcqs, _ = await generate_mcqs(
+            f"{subject}: very high-yield exam questions, each on a different topic within {subject}", count,
+            avoid=avoid, high_yield=True, expl_chars=BATTLE_EXPLANATION_CHARS,
+        )
+        for m in mcqs:
+            m["subject"] = subject
+    else:
+        subjects = random.sample(pool, min(count, len(pool)))
+        mcqs, _ = await generate_mcqs(
+            "very high-yield exam questions across the listed subjects", len(subjects),
+            subjects=subjects, high_yield=True, expl_chars=BATTLE_EXPLANATION_CHARS,
+        )
+    ids = []
+    for m in mcqs:
+        opts = m["options"]
+        h = _make_hash(m["question"], opts[0])
+        new_id = await insert_mcq({
+            "question": m["question"],
+            "option_a": opts[0], "option_b": opts[1], "option_c": opts[2], "option_d": opts[3],
+            "correct": m["correct"], "explanation": m.get("explanation"),
+            "subject": m.get("subject") if m.get("subject") in pool else None,
+            "topic": "", "difficulty": "NEET PG",
+            "source_type": "gemini_battle", "source_chat": 0, "imported_by": 0,
+            "approved": True, "hash": h,
+        })
+        ids.append(new_id or await get_mcq_id_by_hash(h))
+    return [i for i in ids if i]
 
 
 def _ans_cb(letter, mcq_id, battle_id, q_index):
@@ -110,12 +178,45 @@ async def _start_battle_setup(update, context, mode):
 
 
 async def battle_setup_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Step 1: timer buttons (bsetup_timer_N). Step 2: subject buttons (bsetup_subj_...)."""
     query = update.callback_query
     await query.answer()
     user = update.effective_user
+    setup = context.user_data.get("battle_setup")
+    if not setup or setup["challenger_id"] != user.id:
+        await query.edit_message_text("❌ Setup expired. Please run the command again.")
+        return
+
+    if query.data.startswith("bsetup_timer_"):
+        setup["time_per_q"] = int(query.data.replace("bsetup_timer_", ""))
+        await query.edit_message_text(
+            f"⚔️ Challenging @{setup['target']} · ⏱ {setup['time_per_q']}s per question\n\n"
+            "📚 Choose the battle subject:",
+            reply_markup=_subject_keyboard()
+        )
+        return
+
+    if query.data.startswith("bsetup_subj_"):
+        key = query.data.replace("bsetup_subj_", "")
+        subject = None
+        if key != "all":
+            try:
+                subject = _subject_pool()[int(key)]
+            except (ValueError, IndexError):
+                return
+        if not setup.get("time_per_q"):
+            await query.edit_message_text("❌ Setup expired. Please run the command again.")
+            return
+        # Gemini can take 20-30 s. Run in the background so other players' taps aren't blocked.
+        context.application.create_task(_battle_setup(update, context, setup["time_per_q"], subject))
+
+
+async def _battle_setup(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                        time_per_q: int, subject: str | None):
+    query = update.callback_query
+    user = update.effective_user
 
     try:
-        time_per_q = int(query.data.replace("bsetup_timer_", ""))
         setup = context.user_data.get("battle_setup")
 
         if not setup or setup["challenger_id"] != user.id:
@@ -128,13 +229,32 @@ async def battle_setup_callback(update: Update, context: ContextTypes.DEFAULT_TY
         chat_id = setup["chat_id"]
         challenger_name = setup["challenger_name"]
 
-        mcqs = await get_mcqs_for_quiz(limit=10)
-        if not mcqs:
-            await query.edit_message_text("❌ Not enough MCQs in the database yet.")
-            return
+        await query.edit_message_text(
+            f"🤖 Gemini is writing very high-yield {subject or 'mixed-subject'} questions…\n(about 20-30 seconds)")
+        ai_note = f"🤖 Gemini AI · {('📚 ' + subject) if subject else '🎲 mixed subjects'} · very high-yield"
+        try:
+            question_ids = await _gemini_battle_question_ids(subject=subject)
+        except GeminiError as e:
+            logger.warning(f"Battle: Gemini failed, using saved questions: {e}")
+            question_ids = []
+        except Exception:
+            logger.exception("Battle: Gemini question generation crashed")
+            question_ids = []
+
+        if len(question_ids) < 3:
+            mcqs = await get_mcqs_for_quiz(limit=BATTLE_QUESTIONS)
+            if not mcqs:
+                await query.edit_message_text("❌ Could not make questions (Gemini is busy and the database is empty). Try again in a minute.")
+                return
+            question_ids = [m["id"] for m in mcqs]
+            ai_note = "📚 Saved questions (Gemini was busy)"
+            if subject:
+                same = await get_mcqs_for_quiz(subject=subject, limit=BATTLE_QUESTIONS)
+                if len(same) >= 3:
+                    question_ids = [m["id"] for m in same]
+                    ai_note = f"📚 Saved {subject} questions (Gemini was busy)"
 
         battle_id = f"btl{uuid.uuid4().hex[:6]}"
-        question_ids = [m["id"] for m in mcqs]
 
         await create_battle({
             "battle_id": battle_id,
@@ -163,6 +283,7 @@ async def battle_setup_callback(update: Update, context: ContextTypes.DEFAULT_TY
             f"⚔️ *{challenger_name}* challenges @{target} to a battle!\n\n"
             f"❓ Questions: {len(question_ids)}\n"
             f"⏱ Time per question: *{time_per_q}s*\n"
+            f"{ai_note}\n"
             f"🎮 {mode_tag}\n\n"
             f"Accept within {BATTLE_INVITE_TIMEOUT} seconds:"
         )
@@ -270,11 +391,12 @@ async def _send_dm_question(context, user_id, battle_id, q_index, question_ids, 
         total = len(question_ids)
         text = (
             f"⚔️ *BATTLE — Q{q_index+1}/{total}*\n"
-            f"⏱ You have *{time_per_q} seconds*\n\n"
-            f"{mcq['question']}\n\n"
+            f"⏱ You have *{time_per_q} seconds*"
+            f"{(' · 📚 ' + _md(mcq['subject'])) if mcq.get('subject') else ''}\n\n"
+            f"{_md(mcq['question'])}\n\n"
         )
         for i, opt in enumerate(opts):
-            text += f"*{letters[i]}.* {opt}\n"
+            text += f"*{letters[i]}.* {_md(opt)}\n"
 
         kb = InlineKeyboardMarkup([[
             InlineKeyboardButton(
@@ -440,9 +562,10 @@ async def _handle_battle_answer(update: Update, context: ContextTypes.DEFAULT_TY
 
         result_msg = (
             f"{icon} *{'Correct!' if is_correct else 'Wrong!'}* {speed_tag}\n"
-            f"Your answer: *{chosen}* | Correct: *{mcq['correct']}* — {correct_text}\n"
-            f"⏱ {time_taken:.1f}s | ⚡ XP: {'+' if xp >= 0 else ''}{xp}\n\n"
-            f"⏳ Waiting for opponent..."
+            f"Your answer: *{chosen}* | Correct: *{mcq['correct']}* — {_md(correct_text)}\n"
+            f"⏱ {time_taken:.1f}s | ⚡ XP: {'+' if xp >= 0 else ''}{xp}\n"
+            + (f"\n💡 {_md(mcq['explanation'])}\n" if mcq.get("explanation") else "")
+            + "\n⏳ Waiting for opponent..."
         )
 
         try:
