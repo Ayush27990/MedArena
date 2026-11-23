@@ -1,5 +1,6 @@
+
 """
-Configuration - load from environment variables
+MedArena Configuration
 """
 
 import os
@@ -7,41 +8,104 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# Telegram
-BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+# --------------------------------------------------
+# TELEGRAM
+# Accept all common hosting environment variable names
+# --------------------------------------------------
 
-# Database (PostgreSQL on Railway)
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://user:pass@localhost/medquiz")
+BOT_TOKEN = (
+    os.getenv("BOT_TOKEN")
+    or os.getenv("TELEGRAM_BOT_TOKEN")
+    or os.getenv("TELEGRAM_TOKEN")
+    or ""
+).strip()
 
-# Groq AI
+if not BOT_TOKEN:
+    raise RuntimeError(
+        "Telegram bot token missing! "
+        "Set BOT_TOKEN or TELEGRAM_BOT_TOKEN in FadeHost."
+    )
+
+# --------------------------------------------------
+# DATABASE
+# --------------------------------------------------
+
+DATABASE_URL = os.getenv(
+    "DATABASE_URL",
+    "postgresql://user:pass@localhost/medquiz"
+)
+
+# --------------------------------------------------
+# GROQ AI
+# --------------------------------------------------
+
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
+
 GROQ_MODEL_FAST = "llama-3.1-8b-instant"
 GROQ_MODEL_SMART = "llama-3.3-70b-versatile"
 
-# Admin user IDs (comma-separated in env)
+# --------------------------------------------------
+# GEMINI AI
+# --------------------------------------------------
+
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+
+# --------------------------------------------------
+# ADMIN
+# --------------------------------------------------
+
 _admin_raw = os.getenv("ADMIN_IDS", "")
-ADMIN_IDS = [int(x.strip()) for x in _admin_raw.split(",") if x.strip().isdigit()]
 
-# Source channels/groups to monitor for MCQ import
-# Comma-separated list of chat IDs
+ADMIN_IDS = [
+    int(x.strip())
+    for x in _admin_raw.split(",")
+    if x.strip().isdigit()
+]
+
+# --------------------------------------------------
+# SOURCE CHANNELS
+# --------------------------------------------------
+
 _sources_raw = os.getenv("SOURCE_CHAT_IDS", "")
-SOURCE_CHAT_IDS = [int(x.strip()) for x in _sources_raw.split(",") if x.strip()]
 
-# Quiz settings
-DEFAULT_QUESTION_TIME = 30       # seconds per question
+SOURCE_CHAT_IDS = [
+    int(x.strip())
+    for x in _sources_raw.split(",")
+    if x.strip()
+]
+
+# --------------------------------------------------
+# QUIZ SETTINGS
+# --------------------------------------------------
+
+DEFAULT_QUESTION_TIME = 30
+
 DEFAULT_QUESTIONS_PER_QUIZ = 10
+
 MAX_QUESTIONS_PER_QUIZ = 50
 
-# Battle settings
-BATTLE_INVITE_TIMEOUT = 60       # seconds to accept a battle challenge
-BATTLE_BONUS_SPEED_SECONDS = 10  # answer within this time for speed bonus
+# --------------------------------------------------
+# BATTLE SETTINGS
+# --------------------------------------------------
 
-# XP system
+BATTLE_INVITE_TIMEOUT = 60
+
+BATTLE_BONUS_SPEED_SECONDS = 10
+
+# --------------------------------------------------
+# XP SYSTEM
+# --------------------------------------------------
+
 XP_CORRECT = 10
+
 XP_WRONG = -2
+
 XP_SPEED_BONUS = 5
 
-# Difficulty labels
+# --------------------------------------------------
+# DIFFICULTY
+# --------------------------------------------------
+
 DIFFICULTIES = [
     "Easy",
     "Medium",
@@ -52,7 +116,10 @@ DIFFICULTIES = [
     "USMLE",
 ]
 
-# Medical subjects
+# --------------------------------------------------
+# MEDICAL SUBJECTS
+# --------------------------------------------------
+
 SUBJECTS = [
     "Anatomy",
     "Physiology",
