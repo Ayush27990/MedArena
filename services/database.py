@@ -434,3 +434,10 @@ async def update_mcq_by_hash(hash: str, field: str, value: str):
             f"UPDATE mcqs SET {field}=$1, updated_at=NOW() WHERE hash=$2",
             value, hash
         )
+async def get_mcq_id_by_hash(hash: str):
+    """Return the id of the MCQ with this hash, or None."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        return await conn.fetchval(
+            "SELECT id FROM mcqs WHERE hash=$1", hash
+        )
