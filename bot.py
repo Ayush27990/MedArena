@@ -115,7 +115,7 @@ def main():
     app.add_handler(CallbackQueryHandler(quiz_callback_handler, pattern=r'^quiz_'))
     app.add_handler(CallbackQueryHandler(quiz_callback_handler, pattern=r'^my_stats$'))
     app.add_handler(CallbackQueryHandler(quiz_callback_handler, pattern=r'^leaderboard$'))
-    app.add_handler(CallbackQueryHandler(battle_setup_callback, pattern=r'^bsetup_timer_'))
+    app.add_handler(CallbackQueryHandler(battle_setup_callback, pattern=r'^bsetup_(timer|subj)_'))
     app.add_handler(CallbackQueryHandler(accept_battle_handler, pattern=r'^accept_battle_'))
     app.add_handler(CallbackQueryHandler(battle_callback_handler, pattern=r'^battle_'))
     app.add_handler(CallbackQueryHandler(battle_callback_handler, pattern=r'^ba\|'))
