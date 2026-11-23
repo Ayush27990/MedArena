@@ -8,8 +8,9 @@ Gemini writes the MCQs, the bot shows each one to the admin as a preview,
 and NOTHING is posted to a group until the admin taps "Send to group".
 Approved MCQs are posted as Telegram quiz polls and also saved in the database.
 
-Groups to post to: TARGET_CHAT_IDS env var (comma-separated).
+Groups to choose from: TARGET_CHAT_IDS env var (comma-separated).
 If TARGET_CHAT_IDS is empty, SOURCE_CHAT_IDS is used instead.
+After generating, the admin taps which group(s) should receive the MCQs.
 """
 
 import os
@@ -45,6 +46,31 @@ def _preview_text(i: int, total: int, mcq: dict) -> str:
     if mcq.get("explanation"):
         lines += ["", f"💡 {mcq['explanation']}"]
     return "\n".join(lines)
+
+
+def _title(data: dict, chat_id: int) -> str:
+    return data["titles"].get(chat_id) or str(chat_id)
+
+
+def _selector_text(data: dict) -> str:
+    chosen = [_title(data, c) for c in data["targets"] if c in data["selected"]]
+    shown = ", ".join(chosen) if chosen else "none yet"
+    return f"📍 Which group should get these MCQs?\nTap to select (tap again to unselect).\n\nSelected: {shown}"
+
+
+def _selector_markup(batch: str, data: dict) -> InlineKeyboardMarkup:
+    rows = []
+    for i, cid in enumerate(data["targets"]):
+        mark = "✅" if cid in data["selected"] else "▫️"
+        rows.append([InlineKeyboardButton(f"{mark} {_title(data, cid)}"[:60], callback_data=f"gen_g|{batch}|{i}")])
+    if len(data["targets"]) > 1:
+        all_on = len(data["selected"]) == len(data["targets"])
+        rows.append([InlineKeyboardButton(("✅" if all_on else "▫️") + " All groups", callback_data=f"gen_g|{batch}|all")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _selected_chats(data: dict) -> list[int]:
+    return [c for c in data["targets"] if c in data["selected"]]
 
 
 def _buttons(batch: str, idx: int) -> InlineKeyboardMarkup:
@@ -103,14 +129,29 @@ async def generate_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     batch = uuid.uuid4().hex[:6]
     items = [{"mcq": m, "status": None, "msg_id": None} for m in mcqs]
-    _drafts(context)[batch] = {"admin": user.id, "chat_id": msg.chat_id, "topic": topic, "items": items}
+    titles = {}
+    for cid in targets:
+        try:
+            chat = await context.bot.get_chat(cid)
+            titles[cid] = chat.title or str(cid)
+        except Exception:
+            titles[cid] = str(cid)
+    data = {
+        "admin": user.id, "chat_id": msg.chat_id, "topic": topic, "items": items,
+        "targets": targets, "titles": titles,
+        "selected": set(targets) if len(targets) == 1 else set(),
+    }
+    _drafts(context)[batch] = data
 
     note = f" ({dropped} unusable one(s) were left out)" if dropped else ""
     await working.edit_text(
         f"✅ {len(mcqs)} draft(s) ready{note}.\n"
-        f"Nothing is posted until you tap “Send to group”. "
-        f"Approved ones go to {len(targets)} group(s)."
+        f"Nothing is posted until you tap “Send to group”."
     )
+    if len(targets) > 1:
+        await msg.reply_text(_selector_text(data), reply_markup=_selector_markup(batch, data))
+    else:
+        await msg.reply_text(f"📍 Posting will go to: {_title(data, targets[0])}")
 
     for i, item in enumerate(items):
         sent = await msg.reply_text(_preview_text(i, len(items), item["mcq"]), reply_markup=_buttons(batch, i))
@@ -125,11 +166,12 @@ async def generate_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
-async def _post_to_groups(context: ContextTypes.DEFAULT_TYPE, mcq: dict, admin_id: int) -> tuple[int, list[int]]:
-    """Post one MCQ as a quiz poll to every target group. Returns (ok_count, failed_chat_ids)."""
+async def _post_to_groups(context: ContextTypes.DEFAULT_TYPE, mcq: dict, admin_id: int,
+                          chat_ids: list[int]) -> tuple[int, list[int]]:
+    """Post one MCQ as a quiz poll to the chosen groups. Returns (ok_count, failed_chat_ids)."""
     ok, failed = 0, []
     correct_idx = "ABCD".index(mcq["correct"])
-    for chat_id in _target_chats():
+    for chat_id in chat_ids:
         try:
             await context.bot.send_poll(
                 chat_id=chat_id,
@@ -196,6 +238,30 @@ async def generate_callback_handler(update: Update, context: ContextTypes.DEFAUL
     chat_id = data["chat_id"]
     admin_id = q.from_user.id
 
+    if action == "gen_g":
+        if idx_raw == "all":
+            if len(data["selected"]) == len(data["targets"]):
+                data["selected"] = set()
+            else:
+                data["selected"] = set(data["targets"])
+        else:
+            try:
+                cid = data["targets"][int(idx_raw)]
+            except (ValueError, IndexError):
+                await q.answer()
+                return
+            data["selected"] ^= {cid}
+        await q.answer()
+        try:
+            await q.edit_message_text(_selector_text(data), reply_markup=_selector_markup(batch, data))
+        except Exception:
+            pass
+        return
+
+    if action in ("gen_ok", "gen_all") and not _selected_chats(data):
+        await q.answer("Choose a group first (tap a group name above).", show_alert=True)
+        return
+
     if action in ("gen_ok", "gen_no"):
         try:
             idx = int(idx_raw)
@@ -215,7 +281,7 @@ async def generate_callback_handler(update: Update, context: ContextTypes.DEFAUL
             return
 
         await q.answer("Sending…")
-        ok, failed = await _post_to_groups(context, item["mcq"], admin_id)
+        ok, failed = await _post_to_groups(context, item["mcq"], admin_id, _selected_chats(data))
         if ok:
             item["status"] = "sent"
             tail = f"\n\n✅ Sent to {ok} group(s)"
@@ -235,7 +301,7 @@ async def generate_callback_handler(update: Update, context: ContextTypes.DEFAUL
         for i, item in enumerate(items):
             if item["status"]:
                 continue
-            ok, failed = await _post_to_groups(context, item["mcq"], admin_id)
+            ok, failed = await _post_to_groups(context, item["mcq"], admin_id, _selected_chats(data))
             if ok:
                 item["status"] = "sent"
                 sent_n += 1
