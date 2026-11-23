@@ -9,7 +9,7 @@ import asyncio
 import logging
 from datetime import datetime
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import ContextTypes
+from telegram.ext import ContextTypes, ApplicationHandlerStop
 from services.database import (
     get_mcqs_for_quiz, create_battle, get_battle, update_battle,
     get_mcq_by_id, record_answer, add_xp, get_user_by_username,
@@ -46,7 +46,10 @@ def _subject_pool() -> list[str]:
 
 def _subject_keyboard() -> InlineKeyboardMarkup:
     pool = _subject_pool()
-    rows = [[InlineKeyboardButton("🎲 Mixed (all subjects)", callback_data="bsetup_subj_all")]]
+    rows = [
+        [InlineKeyboardButton("🎲 Mixed (all subjects)", callback_data="bsetup_subj_all")],
+        [InlineKeyboardButton("✍️ Type my own topic", callback_data="bsetup_typeany")],
+    ]
     for i in range(0, len(pool), 2):
         rows.append([
             InlineKeyboardButton(pool[j][:24], callback_data=f"bsetup_subj_{j}")
@@ -55,12 +58,37 @@ def _subject_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
-async def _gemini_battle_question_ids(count: int = BATTLE_QUESTIONS, subject: str | None = None) -> list[int]:
+def _subject_action_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("⭐ Whole subject (high yield)", callback_data="bsetup_whole")],
+        [InlineKeyboardButton("✍️ Type a topic in this subject", callback_data="bsetup_typesub")],
+    ])
+
+
+async def _gemini_battle_question_ids(count: int = BATTLE_QUESTIONS,
+                                      subject: str | None = None,
+                                      topic: str | None = None) -> list[int]:
     """Ask Gemini for very high-yield MCQs, save them (approved, so they join the question
-    bank) and return their database ids. subject=None -> mixed: one question from each of
-    `count` different subjects. subject="X" -> `count` different questions all on X."""
+    bank) and return their database ids.
+    subject=None, topic=None -> mixed: one question from each of `count` different subjects.
+    subject="X"  -> `count` different questions all on X.
+    topic="T"    -> `count` different questions on topic T (inside `subject` if given)."""
     pool = _subject_pool()
-    if subject:
+    if topic:
+        try:
+            avoid = [r["question"] for r in await search_mcqs(keyword=topic, limit=25)]
+        except Exception:
+            avoid = []
+        scope = (subject + " - " + topic) if subject else topic
+        mcqs, _ = await generate_mcqs(
+            "very high-yield exam questions on the topic: " + scope +
+            ". Cover different important facts and clinical points of this topic.",
+            count, avoid=avoid, high_yield=True, expl_chars=BATTLE_EXPLANATION_CHARS,
+        )
+        if subject:
+            for m in mcqs:
+                m["subject"] = subject
+    elif subject:
         try:
             avoid = [r["question"] for r in await search_mcqs(subject=subject, limit=25)]
         except Exception:
@@ -86,7 +114,7 @@ async def _gemini_battle_question_ids(count: int = BATTLE_QUESTIONS, subject: st
             "option_a": opts[0], "option_b": opts[1], "option_c": opts[2], "option_d": opts[3],
             "correct": m["correct"], "explanation": m.get("explanation"),
             "subject": m.get("subject") if m.get("subject") in pool else None,
-            "topic": "", "difficulty": "NEET PG",
+            "topic": topic or "", "difficulty": "NEET PG",
             "source_type": "gemini_battle", "source_chat": 0, "imported_by": 0,
             "approved": True, "hash": h,
         })
@@ -178,7 +206,7 @@ async def _start_battle_setup(update, context, mode):
 
 
 async def battle_setup_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Step 1: timer buttons (bsetup_timer_N). Step 2: subject buttons (bsetup_subj_...)."""
+    """Setup buttons: timer -> subject -> (whole subject | typed topic)."""
     query = update.callback_query
     await query.answer()
     user = update.effective_user
@@ -187,40 +215,98 @@ async def battle_setup_callback(update: Update, context: ContextTypes.DEFAULT_TY
         await query.edit_message_text("❌ Setup expired. Please run the command again.")
         return
 
-    if query.data.startswith("bsetup_timer_"):
-        setup["time_per_q"] = int(query.data.replace("bsetup_timer_", ""))
+    data = query.data
+
+    # Step 1: timer
+    if data.startswith("bsetup_timer_"):
+        setup["time_per_q"] = int(data.replace("bsetup_timer_", ""))
+        setup["await_topic"] = False
+        setup["subject"] = None
         await query.edit_message_text(
             f"⚔️ Challenging @{setup['target']} · ⏱ {setup['time_per_q']}s per question\n\n"
-            "📚 Choose the battle subject:",
+            "📚 Choose the battle subject, or type your own topic:",
             reply_markup=_subject_keyboard()
         )
         return
 
-    if query.data.startswith("bsetup_subj_"):
-        key = query.data.replace("bsetup_subj_", "")
-        subject = None
-        if key != "all":
-            try:
-                subject = _subject_pool()[int(key)]
-            except (ValueError, IndexError):
-                return
-        if not setup.get("time_per_q"):
-            await query.edit_message_text("❌ Setup expired. Please run the command again.")
+    if not setup.get("time_per_q"):
+        await query.edit_message_text("❌ Setup expired. Please run the command again.")
+        return
+
+    # Type a topic (no subject restriction)
+    if data == "bsetup_typeany":
+        setup["subject"] = None
+        setup["await_topic"] = True
+        await query.edit_message_text(
+            "✍️ Send me the topic now.\n\n"
+            "Examples: Nephrotic syndrome, Beta blockers, Brachial plexus"
+        )
+        return
+
+    # Type a topic inside the chosen subject
+    if data == "bsetup_typesub":
+        setup["await_topic"] = True
+        await query.edit_message_text(
+            "✍️ Send me the topic in " + str(setup.get("subject")) + " now."
+        )
+        return
+
+    # Whole chosen subject
+    if data == "bsetup_whole":
+        context.application.create_task(
+            _battle_setup(context, user, query.message, setup["time_per_q"],
+                          setup.get("subject"), None)
+        )
+        return
+
+    # Subject picked (or mixed)
+    if data.startswith("bsetup_subj_"):
+        key = data.replace("bsetup_subj_", "")
+        if key == "all":
+            # Gemini can take 20-30 s. Run in the background so other taps aren't blocked.
+            context.application.create_task(
+                _battle_setup(context, user, query.message, setup["time_per_q"], None, None)
+            )
             return
-        # Gemini can take 20-30 s. Run in the background so other players' taps aren't blocked.
-        context.application.create_task(_battle_setup(update, context, setup["time_per_q"], subject))
+        try:
+            subject = _subject_pool()[int(key)]
+        except (ValueError, IndexError):
+            return
+        setup["subject"] = subject
+        await query.edit_message_text(
+            "📚 Subject: " + subject + "\n\nWhat do you want to battle on?",
+            reply_markup=_subject_action_keyboard()
+        )
 
 
-async def _battle_setup(update: Update, context: ContextTypes.DEFAULT_TYPE,
-                        time_per_q: int, subject: str | None):
-    query = update.callback_query
-    user = update.effective_user
+async def battle_topic_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Catches the typed topic. Does nothing unless the user was asked for a topic."""
+    setup = context.user_data.get("battle_setup")
+    if not setup or not setup.get("await_topic"):
+        return
+    if update.effective_user.id != setup["challenger_id"]:
+        return
+    topic = (update.effective_message.text or "").strip()[:100]
+    if not topic:
+        return
+    setup["await_topic"] = False
+    msg = await update.effective_message.reply_text(
+        "🤖 Gemini is writing very high-yield questions on: " + topic + "\n(about 20-30 seconds)"
+    )
+    context.application.create_task(
+        _battle_setup(context, update.effective_user, msg, setup["time_per_q"],
+                      setup.get("subject"), topic)
+    )
+    raise ApplicationHandlerStop
 
+
+async def _battle_setup(context: ContextTypes.DEFAULT_TYPE, user, msg,
+                        time_per_q: int, subject: str | None, topic: str | None):
     try:
         setup = context.user_data.get("battle_setup")
 
         if not setup or setup["challenger_id"] != user.id:
-            await query.edit_message_text("❌ Setup expired. Please run the command again.")
+            await msg.edit_text("❌ Setup expired. Please run the command again.")
             return
 
         mode = setup["mode"]
@@ -229,11 +315,22 @@ async def _battle_setup(update: Update, context: ContextTypes.DEFAULT_TYPE,
         chat_id = setup["chat_id"]
         challenger_name = setup["challenger_name"]
 
-        await query.edit_message_text(
-            f"🤖 Gemini is writing very high-yield {subject or 'mixed-subject'} questions…\n(about 20-30 seconds)")
-        ai_note = f"🤖 Gemini AI · {('📚 ' + subject) if subject else '🎲 mixed subjects'} · very high-yield"
+        if topic:
+            what = topic
+        else:
+            what = subject or "mixed-subject"
+        await msg.edit_text(
+            f"🤖 Gemini is writing very high-yield {what} questions…\n(about 20-30 seconds)")
+
+        if topic:
+            ai_note = "🤖 Gemini AI · ✍️ " + _md(topic) + (" (" + _md(subject) + ")" if subject else "") + " · very high-yield"
+        elif subject:
+            ai_note = "🤖 Gemini AI · 📚 " + _md(subject) + " · very high-yield"
+        else:
+            ai_note = "🤖 Gemini AI · 🎲 mixed subjects · very high-yield"
+
         try:
-            question_ids = await _gemini_battle_question_ids(subject=subject)
+            question_ids = await _gemini_battle_question_ids(subject=subject, topic=topic)
         except GeminiError as e:
             logger.warning(f"Battle: Gemini failed, using saved questions: {e}")
             question_ids = []
@@ -244,15 +341,20 @@ async def _battle_setup(update: Update, context: ContextTypes.DEFAULT_TYPE,
         if len(question_ids) < 3:
             mcqs = await get_mcqs_for_quiz(limit=BATTLE_QUESTIONS)
             if not mcqs:
-                await query.edit_message_text("❌ Could not make questions (Gemini is busy and the database is empty). Try again in a minute.")
+                await msg.edit_text("❌ Could not make questions (Gemini is busy and the database is empty). Try again in a minute.")
                 return
             question_ids = [m["id"] for m in mcqs]
             ai_note = "📚 Saved questions (Gemini was busy)"
-            if subject:
+            if topic:
+                same = await get_mcqs_for_quiz(subject=subject, topic=topic, limit=BATTLE_QUESTIONS)
+                if len(same) >= 3:
+                    question_ids = [m["id"] for m in same]
+                    ai_note = "📚 Saved questions on " + _md(topic) + " (Gemini was busy)"
+            elif subject:
                 same = await get_mcqs_for_quiz(subject=subject, limit=BATTLE_QUESTIONS)
                 if len(same) >= 3:
                     question_ids = [m["id"] for m in same]
-                    ai_note = f"📚 Saved {subject} questions (Gemini was busy)"
+                    ai_note = f"📚 Saved {_md(subject)} questions (Gemini was busy)"
 
         battle_id = f"btl{uuid.uuid4().hex[:6]}"
 
@@ -289,7 +391,7 @@ async def _battle_setup(update: Update, context: ContextTypes.DEFAULT_TYPE,
         )
 
         # Send to challenger's chat
-        await query.edit_message_text(
+        await msg.edit_text(
             invite_text, parse_mode="Markdown", reply_markup=kb
         )
 
@@ -305,8 +407,11 @@ async def _battle_setup(update: Update, context: ContextTypes.DEFAULT_TYPE,
             logger.error(f"Could not send battle invite to opponent {target_id}: {e}")
 
     except Exception as e:
-        logger.error(f"battle_setup_callback error: {e}", exc_info=True)
-        await query.edit_message_text(f"❌ Error setting up battle: {e}")
+        logger.error(f"battle_setup error: {e}", exc_info=True)
+        try:
+            await msg.edit_text(f"❌ Error setting up battle: {e}")
+        except Exception:
+            pass
 
 
 async def accept_battle_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
