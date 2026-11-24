@@ -757,6 +757,50 @@ async def _start_battle_question(context, battle_id, q_index, question_ids, time
 
 
 # ---------------------------------------------------------
+# TIMEOUT MESSAGE (reveals answer + explanation)
+# ---------------------------------------------------------
+
+def _timeout_text(mcq, q_index):
+    """Return (markdown_text, plain_text) for a player who ran out of time."""
+
+    head_md = (
+        f"⏰ *Time's up for question {q_index + 1}!*\n"
+        "No answer recorded. 0 battle points.\n"
+    )
+    head_plain = (
+        f"⏰ Time's up for question {q_index + 1}!\n"
+        "No answer recorded. 0 battle points.\n"
+    )
+
+    if not mcq:
+        return head_md, head_plain
+
+    correct = mcq["correct"]
+
+    correct_text = {
+        "A": mcq["option_a"],
+        "B": mcq["option_b"],
+        "C": mcq["option_c"],
+        "D": mcq["option_d"],
+    }.get(correct, correct)
+
+    md_text = (
+        head_md
+        + f"\n✅ Correct answer: *{correct}* — {_md(correct_text)}\n"
+    )
+    plain_text = (
+        head_plain
+        + f"\n✅ Correct answer: {correct} — {correct_text}\n"
+    )
+
+    if mcq["explanation"]:
+        md_text += f"\n💡 {_md(mcq['explanation'])}\n"
+        plain_text += f"\n💡 {mcq['explanation']}\n"
+
+    return md_text, plain_text
+
+
+# ---------------------------------------------------------
 # SHARED TIMEOUT
 # ---------------------------------------------------------
 
@@ -778,6 +822,13 @@ async def _question_timeout(context, battle_id, q_index, question_ids, time_per_
 
             answer_times = _json_load(battle["answer_times"])
 
+            # Load the question once so we can reveal the answer + explanation.
+            try:
+                timeout_mcq = await get_mcq_by_id(question_ids[q_index])
+            except Exception:
+                logger.exception("Could not load question for timeout reveal.")
+                timeout_mcq = None
+
             for uid in (battle["challenger"], battle["opponent"]):
                 key = _answer_key(q_index, uid)
 
@@ -790,16 +841,23 @@ async def _question_timeout(context, battle_id, q_index, question_ids, time_per_
                         "timed_out": True,
                     }
 
+                    md_text, plain_text = _timeout_text(timeout_mcq, q_index)
+
                     try:
                         await context.bot.send_message(
                             chat_id=uid,
-                            text=(
-                                f"⏰ Time's up for question {q_index + 1}!\n"
-                                "No answer recorded. 0 battle points."
-                            ),
+                            text=md_text,
+                            parse_mode="Markdown",
                         )
                     except Exception:
-                        logger.exception("Could not send timeout notification.")
+                        # Markdown can fail on odd characters; fall back to plain text.
+                        try:
+                            await context.bot.send_message(
+                                chat_id=uid,
+                                text=plain_text,
+                            )
+                        except Exception:
+                            logger.exception("Could not send timeout notification.")
 
             await update_battle(battle_id, answer_times=json.dumps(answer_times))
 
