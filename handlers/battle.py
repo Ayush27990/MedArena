@@ -7,11 +7,15 @@ Fixed:
 4. No unrelated-subject fallback.
 5. Race protection using per-battle asyncio locks.
 6. time_per_q is kept in scores so every question uses the chosen timer.
+7. IMAGE questions: some of the 10 questions (BATTLE_IMAGE_QUESTIONS, default 3) are written by
+   Gemini by looking at real images from the image bank. Players get the photo first,
+   then the question with the A/B/C/D buttons.
 """
 
 import asyncio
 import json
 import logging
+import os
 import random
 import uuid
 from datetime import datetime
@@ -31,10 +35,13 @@ from services.database import (
     insert_mcq,
     get_mcq_id_by_hash,
     search_mcqs,
+    pick_bank_images,
+    bump_bank_image,
 )
 
-from services.gemini_service import generate_mcqs, GeminiError
+from services.gemini_service import generate_mcqs, generate_image_mcq, GeminiError
 from handlers.import_mcq import _make_hash
+from handlers.generate import download_file
 
 from config import (
     BATTLE_INVITE_TIMEOUT,
@@ -54,6 +61,11 @@ logger = logging.getLogger(__name__)
 TIMER_OPTIONS = [15, 20, 30, 45, 60]
 BATTLE_QUESTIONS = 10
 BATTLE_EXPLANATION_CHARS = 400
+
+try:
+    BATTLE_IMAGE_QUESTIONS = max(0, int(os.getenv("BATTLE_IMAGE_QUESTIONS", "").strip() or 3))
+except ValueError:
+    BATTLE_IMAGE_QUESTIONS = 3
 
 _battle_q_starts = {}
 _countdown_tasks = {}
@@ -244,24 +256,93 @@ async def _gemini_battle_question_ids(count=BATTLE_QUESTIONS, subject=None, topi
 
 
 async def _get_matching_saved_questions(subject=None, topic=None, limit=BATTLE_QUESTIONS):
-    questions = await get_mcqs_for_quiz(subject=subject, topic=topic, limit=limit)
+    questions = await get_mcqs_for_quiz(subject=subject, topic=topic, limit=limit, with_images=True)
     return [row["id"] for row in questions]
 
 
-async def _prepare_battle_questions(subject=None, topic=None):
+async def _image_battle_question_ids(bot, count, subject=None, topic=None):
+    """
+    Write up to `count` IMAGE questions with Gemini vision from real images in the image bank.
+    Never raises: if there are no images (or Gemini fails) it just returns fewer ids.
+    """
+    if count <= 0 or bot is None:
+        return []
+
+    try:
+        rows = await pick_bank_images(count, subject=subject, keyword=topic)
+    except Exception:
+        logger.exception("Could not read the image bank.")
+        return []
+    if not rows:
+        logger.info("Image bank has no images for subject=%s topic=%s", subject, topic)
+        return []
+
+    async def one(row):
+        try:
+            image = await download_file(bot, row["file_id"])
+            res = await generate_image_mcq(
+                image, hint=topic or "", level="NEET PG / INICET / FMGE"
+            )
+            if not res["uses_image"]:
+                return None
+
+            question = res["question"]
+            options = res["options"]
+            question_hash = _make_hash(question + "|" + row["file_id"], options[0])
+
+            new_id = await insert_mcq({
+                "question": question,
+                "option_a": options[0],
+                "option_b": options[1],
+                "option_c": options[2],
+                "option_d": options[3],
+                "correct": res["correct"],
+                "explanation": res.get("explanation"),
+                "subject": res.get("subject") or row["subject"] or subject,
+                "topic": res.get("topic") or topic or "",
+                "difficulty": "NEET PG",
+                "source_type": "gemini_battle_image",
+                "source_chat": 0,
+                "imported_by": 0,
+                "approved": True,
+                "hash": question_hash,
+                "image_file_id": row["file_id"],
+                "image_layout": "before",
+            })
+            if not new_id:
+                new_id = await get_mcq_id_by_hash(question_hash)
+            await bump_bank_image(row["id"])
+            return new_id
+        except Exception:
+            logger.exception("Could not make a battle image question from image %s", row["id"])
+            return None
+
+    results = await asyncio.gather(*(one(r) for r in rows))
+    return [i for i in results if i]
+
+
+async def _prepare_battle_questions(subject=None, topic=None, bot=None):
+    """Returns (question_ids, used_gemini, image_question_count)."""
+    image_ids = await _image_battle_question_ids(
+        bot, min(BATTLE_IMAGE_QUESTIONS, BATTLE_QUESTIONS - 1), subject=subject, topic=topic
+    )
+
     generated_ids = []
 
     try:
         generated_ids = await _gemini_battle_question_ids(
-            count=BATTLE_QUESTIONS, subject=subject, topic=topic
+            count=BATTLE_QUESTIONS - len(image_ids), subject=subject, topic=topic
         )
     except GeminiError:
         logger.exception("Gemini generation failed.")
     except Exception:
         logger.exception("Unexpected Gemini generation failure.")
 
+    generated_ids = [i for i in generated_ids if i not in image_ids] + image_ids
+    random.shuffle(generated_ids)          # image questions land at random positions
+
     if len(generated_ids) >= BATTLE_QUESTIONS:
-        return generated_ids[:BATTLE_QUESTIONS], True
+        return generated_ids[:BATTLE_QUESTIONS], True, len(image_ids)
 
     try:
         saved_ids = await _get_matching_saved_questions(
@@ -282,7 +363,8 @@ async def _prepare_battle_questions(subject=None, topic=None):
             "Gemini may be temporarily unavailable. Please try again."
         )
 
-    return combined[:BATTLE_QUESTIONS], bool(generated_ids)
+    final = combined[:BATTLE_QUESTIONS]
+    return final, bool(generated_ids), len([i for i in final if i in image_ids])
 
 
 # ---------------------------------------------------------
@@ -499,8 +581,8 @@ async def _battle_setup(context, user, msg, time_per_q, subject, topic):
             "Please wait while the questions are generated..."
         )
 
-        question_ids, used_gemini = await _prepare_battle_questions(
-            subject=subject, topic=topic
+        question_ids, used_gemini, image_count = await _prepare_battle_questions(
+            subject=subject, topic=topic, bot=context.bot
         )
 
         if not question_ids:
@@ -515,6 +597,8 @@ async def _battle_setup(context, user, msg, time_per_q, subject, topic):
             ai_note += f" · {subject}"
         if topic:
             ai_note += f" · {topic}"
+        if image_count:
+            ai_note += f" · 🖼 {image_count} image question(s)"
 
         battle_id = f"btl{uuid.uuid4().hex[:8]}"
 
@@ -688,10 +772,26 @@ async def _send_dm_question(context, user_id, battle_id, q_index, question_ids, 
     options = [mcq["option_a"], mcq["option_b"], mcq["option_c"], mcq["option_d"]]
     total = len(question_ids)
 
+    # Image question: the picture comes first, then the question with the A/B/C/D buttons.
+    image_id = mcq.get("image_file_id")
+    image_failed = False
+    if image_id:
+        try:
+            await context.bot.send_photo(
+                chat_id=user_id,
+                photo=image_id,
+                caption=f"🖼 Q{q_index + 1}/{total} — look at the image, then answer below ⬇️",
+            )
+        except Exception:
+            image_failed = True
+            logger.exception("Could not send the battle image.")
+
     text = (
         f"⚔️ *BATTLE — Q{q_index + 1}/{total}*\n"
         f"⏱ You have *{time_per_q} seconds*\n"
     )
+    if image_failed:
+        text += "⚠️ The image could not be loaded for this question.\n"
 
     if mcq["subject"]:
         text += f"📚 {_md(mcq['subject'])}\n"
@@ -757,50 +857,6 @@ async def _start_battle_question(context, battle_id, q_index, question_ids, time
 
 
 # ---------------------------------------------------------
-# TIMEOUT MESSAGE (reveals answer + explanation)
-# ---------------------------------------------------------
-
-def _timeout_text(mcq, q_index):
-    """Return (markdown_text, plain_text) for a player who ran out of time."""
-
-    head_md = (
-        f"⏰ *Time's up for question {q_index + 1}!*\n"
-        "No answer recorded. 0 battle points.\n"
-    )
-    head_plain = (
-        f"⏰ Time's up for question {q_index + 1}!\n"
-        "No answer recorded. 0 battle points.\n"
-    )
-
-    if not mcq:
-        return head_md, head_plain
-
-    correct = mcq["correct"]
-
-    correct_text = {
-        "A": mcq["option_a"],
-        "B": mcq["option_b"],
-        "C": mcq["option_c"],
-        "D": mcq["option_d"],
-    }.get(correct, correct)
-
-    md_text = (
-        head_md
-        + f"\n✅ Correct answer: *{correct}* — {_md(correct_text)}\n"
-    )
-    plain_text = (
-        head_plain
-        + f"\n✅ Correct answer: {correct} — {correct_text}\n"
-    )
-
-    if mcq["explanation"]:
-        md_text += f"\n💡 {_md(mcq['explanation'])}\n"
-        plain_text += f"\n💡 {mcq['explanation']}\n"
-
-    return md_text, plain_text
-
-
-# ---------------------------------------------------------
 # SHARED TIMEOUT
 # ---------------------------------------------------------
 
@@ -822,13 +878,6 @@ async def _question_timeout(context, battle_id, q_index, question_ids, time_per_
 
             answer_times = _json_load(battle["answer_times"])
 
-            # Load the question once so we can reveal the answer + explanation.
-            try:
-                timeout_mcq = await get_mcq_by_id(question_ids[q_index])
-            except Exception:
-                logger.exception("Could not load question for timeout reveal.")
-                timeout_mcq = None
-
             for uid in (battle["challenger"], battle["opponent"]):
                 key = _answer_key(q_index, uid)
 
@@ -841,23 +890,16 @@ async def _question_timeout(context, battle_id, q_index, question_ids, time_per_
                         "timed_out": True,
                     }
 
-                    md_text, plain_text = _timeout_text(timeout_mcq, q_index)
-
                     try:
                         await context.bot.send_message(
                             chat_id=uid,
-                            text=md_text,
-                            parse_mode="Markdown",
+                            text=(
+                                f"⏰ Time's up for question {q_index + 1}!\n"
+                                "No answer recorded. 0 battle points."
+                            ),
                         )
                     except Exception:
-                        # Markdown can fail on odd characters; fall back to plain text.
-                        try:
-                            await context.bot.send_message(
-                                chat_id=uid,
-                                text=plain_text,
-                            )
-                        except Exception:
-                            logger.exception("Could not send timeout notification.")
+                        logger.exception("Could not send timeout notification.")
 
             await update_battle(battle_id, answer_times=json.dumps(answer_times))
 
