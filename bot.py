@@ -19,11 +19,17 @@ from config import BOT_TOKEN
 from handlers.start import start_handler, help_handler
 
 from handlers.import_mcq import (
-    handle_poll,
-    handle_text_mcq,
     handle_document,
-    handle_photo,
     handle_explanation_text
+)
+
+# Polls / text / images sent by an admin in a private chat become AI drafts
+# (with "send to group" approval). Everything else still uses the old importer.
+from handlers.source_draft import (
+    source_poll_handler,
+    source_text_mcq_handler,
+    source_photo_handler,
+    handle_source_text
 )
 
 from handlers.quiz import (
@@ -108,6 +114,17 @@ async def handle_text(
     if handled:
         return
 
+    # Admin is in the middle of an admin edit/search: that wins.
+    if context.user_data.get("awaiting_edit_text") or context.user_data.get("admin_search_mode"):
+        await handle_admin_search(update, context)
+        return
+
+    # Any other text from an admin in a private chat -> AI draft with approval
+    handled = await handle_source_text(update, context)
+
+    if handled:
+        return
+
     await handle_admin_search(update, context)
 
 
@@ -172,7 +189,7 @@ def main():
 
     # MCQ IMPORT
     app.add_handler(
-        MessageHandler(filters.POLL, handle_poll)
+        MessageHandler(filters.POLL, source_poll_handler)
     )
 
     app.add_handler(
@@ -180,7 +197,7 @@ def main():
             filters.TEXT & filters.Regex(
                 r'(?i)(^\d+[\.\)]|^Q[\.\)]|^Question)'
             ),
-            handle_text_mcq
+            source_text_mcq_handler
         )
     )
 
@@ -189,7 +206,7 @@ def main():
     )
 
     app.add_handler(
-        MessageHandler(filters.PHOTO, handle_photo)
+        MessageHandler(filters.PHOTO, source_photo_handler)
     )
 
     # GENERAL TEXT
