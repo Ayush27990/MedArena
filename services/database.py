@@ -104,6 +104,22 @@ async def init_db():
                 created_at  TIMESTAMPTZ DEFAULT NOW()
             );
 
+            -- Image-based MCQs: Telegram file_id of the picture + how it is posted
+            ALTER TABLE mcqs ADD COLUMN IF NOT EXISTS image_file_id TEXT;
+            ALTER TABLE mcqs ADD COLUMN IF NOT EXISTS image_layout  TEXT;
+
+            -- Real images you sent to the bot; auto + battle mode write questions from these
+            CREATE TABLE IF NOT EXISTS image_bank (
+                id             SERIAL PRIMARY KEY,
+                file_id        TEXT NOT NULL,
+                file_unique_id TEXT UNIQUE,
+                subject        TEXT,
+                note           TEXT,
+                uses           INT DEFAULT 0,
+                added_by       BIGINT,
+                created_at     TIMESTAMPTZ DEFAULT NOW()
+            );
+
             CREATE INDEX IF NOT EXISTS idx_mcqs_subject    ON mcqs(subject);
             CREATE INDEX IF NOT EXISTS idx_mcqs_difficulty ON mcqs(difficulty);
             CREATE INDEX IF NOT EXISTS idx_mcqs_approved   ON mcqs(approved);
@@ -122,8 +138,9 @@ async def insert_mcq(data: dict) -> int | None:
             INSERT INTO mcqs
                 (question, option_a, option_b, option_c, option_d, option_e,
                  correct, explanation, subject, topic, difficulty,
-                 source_type, source_chat, imported_by, approved, hash)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
+                 source_type, source_chat, imported_by, approved, hash,
+                 image_file_id, image_layout)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
             ON CONFLICT (hash) DO NOTHING
             RETURNING id
         """,
@@ -133,14 +150,19 @@ async def insert_mcq(data: dict) -> int | None:
             data.get("subject"), data.get("topic"), data.get("difficulty"),
             data.get("source_type"), data.get("source_chat"),
             data.get("imported_by"), data.get("approved", False),
-            data["hash"]
+            data["hash"],
+            data.get("image_file_id"), data.get("image_layout")
         )
         return row["id"] if row else None
 
 
-async def get_mcqs_for_quiz(subject=None, topic=None, difficulty=None, limit=10):
+async def get_mcqs_for_quiz(subject=None, topic=None, difficulty=None, limit=10, with_images=False):
+    """with_images=False (default) hides image questions, because the normal quiz can't show pictures.
+    Battle mode passes with_images=True."""
     pool = await get_pool()
     filters = ["approved = TRUE"]
+    if not with_images:
+        filters.append("image_file_id IS NULL")
     params = []
     i = 1
     if subject:
@@ -179,6 +201,50 @@ async def search_mcqs(keyword=None, subject=None, topic=None, difficulty=None, l
             f"SELECT * FROM mcqs WHERE {where} ORDER BY created_at DESC LIMIT ${i}",
             *params
         )
+
+
+# ─── Image bank (real images for image-based questions) ──────────────
+
+async def add_bank_image(file_id: str, file_unique_id: str, subject=None, note=None, added_by=0):
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        return await conn.fetchval("""
+            INSERT INTO image_bank (file_id, file_unique_id, subject, note, added_by)
+            VALUES ($1,$2,$3,$4,$5)
+            ON CONFLICT (file_unique_id) DO UPDATE
+              SET file_id = EXCLUDED.file_id,
+                  subject = COALESCE(EXCLUDED.subject, image_bank.subject),
+                  note    = COALESCE(NULLIF(EXCLUDED.note, ''), image_bank.note)
+            RETURNING id
+        """, file_id, file_unique_id, subject, note, added_by)
+
+
+async def pick_bank_images(n=1, subject=None, keyword=None):
+    """Least-used images first (random among ties). Optional subject / keyword filter."""
+    pool = await get_pool()
+    filters, params, i = [], [], 1
+    if subject:
+        filters.append(f"subject ILIKE ${i}"); params.append(subject); i += 1
+    if keyword:
+        filters.append(f"(note ILIKE ${i} OR subject ILIKE ${i})"); params.append(f"%{keyword}%"); i += 1
+    where = ("WHERE " + " AND ".join(filters)) if filters else ""
+    params.append(n)
+    async with pool.acquire() as conn:
+        return await conn.fetch(
+            f"SELECT * FROM image_bank {where} ORDER BY uses ASC, RANDOM() LIMIT ${i}", *params
+        )
+
+
+async def bump_bank_image(image_id: int):
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute("UPDATE image_bank SET uses = uses + 1 WHERE id=$1", image_id)
+
+
+async def count_bank_images() -> int:
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        return await conn.fetchval("SELECT COUNT(*) FROM image_bank")
 
 
 async def get_pending_mcqs(limit=10):
