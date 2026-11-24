@@ -92,7 +92,15 @@ async def _process_mcq_dict(mcq: dict, source_type: str, chat_id: int,
     # AI for subject/topic/difficulty ONLY
     cat = await categorize_mcq(q, opts)
 
-    mcq_hash = _make_hash(q, option_a)
+    # Image questions (and questions where the AI already named the subject/topic)
+    if mcq.get("subject"):
+        cat["subject"] = mcq["subject"]
+    if mcq.get("topic"):
+        cat["topic"] = mcq["topic"]
+    image_file_id = mcq.get("image_file_id")
+
+    # The same question text can belong to different images, so the image is part of the hash.
+    mcq_hash = _make_hash(q + (f"|{image_file_id}" if image_file_id else ""), option_a)
 
     data = {
         "question": q,
@@ -111,6 +119,8 @@ async def _process_mcq_dict(mcq: dict, source_type: str, chat_id: int,
         "imported_by": imported_by,
         "approved": auto_approve,
         "hash": mcq_hash,
+        "image_file_id": image_file_id,
+        "image_layout": mcq.get("image_layout") if image_file_id else None,
     }
 
     inserted_id = await insert_mcq(data)
