@@ -5,6 +5,11 @@ Every AUTO_INTERVAL_MIN minutes the bot asks Gemini for ONE exam-level MCQ,
 rotating through the subjects and alternating NEET PG / USMLE level, and sends
 it to the admin's private chat with one button per group.
 
+Some drafts (AUTO_IMAGE_PERCENT, default 30%) are IMAGE questions: the bot takes a real
+image from the image bank (every image you send the bot is saved there), Gemini looks at
+it and writes the question, and the group gets it as photo + quiz poll.
+Every draft also has Reassess / Regenerate buttons (Gemini or Groq).
+
 Nothing is posted anywhere until the admin taps a group button (or "All groups").
 The MCQ is then posted as a quiz poll to the chosen group(s) and saved
 (approved) in the database for future quizzes. "Skip" discards the draft and
@@ -14,11 +19,13 @@ Admin command (private chat):
   /auto            status
   /auto on | off   resume / pause (until the bot restarts)
   /auto now        make one draft right now
+  /auto image      make one IMAGE draft right now
 
 Optional environment variables:
   AUTO_GENERATE      1 (default) or 0 - start switched on or off
   AUTO_INTERVAL_MIN  minutes between drafts (default 15)
   AUTO_MAX_PENDING   stop making new drafts while this many wait for you (default 3)
+  AUTO_IMAGE_PERCENT chance (0-100) that a draft is an image question (default 30)
   AUTO_SUBJECTS      comma-separated subjects (default: all subjects in config.py)
   AUTO_LEVELS        comma-separated, alternated (default: NEET PG,USMLE)
   AUTO_ADMIN_ID      who receives the drafts (default: first id in ADMIN_IDS)
@@ -30,12 +37,15 @@ import uuid
 import random
 import logging
 from collections import deque
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update
 from telegram.ext import Application, ContextTypes
 from config import ADMIN_IDS, SUBJECTS
-from services.gemini_service import generate_mcqs, GeminiError
-from services.database import search_mcqs
-from handlers.generate import _drafts, _preview_text, _target_chats, _post_to_groups, _clear_buttons
+from services.gemini_service import generate_mcqs, generate_image_mcq, GeminiError
+from services.database import search_mcqs, pick_bank_images, bump_bank_image, count_bank_images
+from handlers.generate import (
+    _drafts, _preview_text, _target_chats, _post_to_groups, _clear_buttons,
+    send_single_draft, download_file, pick_layout, NoTargetGroups,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +59,10 @@ def _env_int(name: str, default: int) -> int:
 
 AUTO_INTERVAL_MIN = _env_int("AUTO_INTERVAL_MIN", 15)
 AUTO_MAX_PENDING = _env_int("AUTO_MAX_PENDING", 3)
+try:
+    AUTO_IMAGE_PERCENT = min(100, max(0, int(os.getenv("AUTO_IMAGE_PERCENT", "").strip() or 30)))
+except ValueError:
+    AUTO_IMAGE_PERCENT = 30
 AUTO_START_ON = os.getenv("AUTO_GENERATE", "1").strip().lower() not in ("0", "off", "false", "no")
 DRAFT_TTL_SECONDS = 24 * 3600
 FAILS_BEFORE_ALERT = 3
@@ -69,17 +83,6 @@ def _admin_id() -> int | None:
     if raw.lstrip("-").isdigit():
         return int(raw)
     return ADMIN_IDS[0] if ADMIN_IDS else None
-
-
-def _auto_buttons(batch: str, data: dict) -> InlineKeyboardMarkup:
-    rows = []
-    for i, cid in enumerate(data["targets"]):
-        rows.append([InlineKeyboardButton(f"✅ Send to {data['titles'].get(cid, cid)}"[:60],
-                                          callback_data=f"agen|{batch}|{i}")])
-    if len(data["targets"]) > 1:
-        rows.append([InlineKeyboardButton("✅ Send to ALL groups", callback_data=f"agen|{batch}|all")])
-    rows.append([InlineKeyboardButton("🗑 Skip", callback_data=f"gen_no|{batch}|0")])
-    return InlineKeyboardMarkup(rows)
 
 
 def _state(context: ContextTypes.DEFAULT_TYPE) -> dict:
@@ -107,7 +110,7 @@ def _pending_count(context: ContextTypes.DEFAULT_TYPE) -> int:
 def _prune(context: ContextTypes.DEFAULT_TYPE) -> None:
     drafts = _drafts(context)
     now = time.time()
-    for batch in [b for b, d in drafts.items() if d.get("auto") and (
+    for batch in [b for b, d in drafts.items() if d.get("flow") == "single" and (
             now - d.get("created", now) > DRAFT_TTL_SECONDS
             or all(i["status"] is not None for i in d["items"]))]:
         drafts.pop(batch, None)
@@ -124,24 +127,36 @@ async def _recent_questions(state: dict, subject: str) -> list[str]:
     return seen
 
 
-async def _group_titles(context: ContextTypes.DEFAULT_TYPE, targets: list[int]) -> dict:
-    cache = _state(context)["titles"]
-    for cid in targets:
-        if cid not in cache:
-            try:
-                cache[cid] = (await context.bot.get_chat(cid)).title or str(cid)
-            except Exception:
-                cache[cid] = str(cid)
-    return {cid: cache[cid] for cid in targets}
+async def _image_draft(state: dict, bot, level: str):
+    """Try to build an IMAGE question from the image bank. Returns (mcq, label) or None."""
+    rows = await pick_bank_images(1)
+    if not rows:
+        return None
+    row = rows[0]
+    try:
+        image = await download_file(bot, row["file_id"])
+    except Exception:
+        logger.exception("Could not download image-bank image %s", row["id"])
+        return None
+    res = await generate_image_mcq(image, level=level, avoid=list(state["recent"]))
+    await bump_bank_image(row["id"])
+
+    mcq = {k: res[k] for k in ("question", "options", "correct", "explanation", "subject", "topic")}
+    if res["uses_image"]:
+        mcq["image_file_id"] = row["file_id"]
+        mcq["layout"] = pick_layout(mcq["question"])
+    label = ("🖼 Image · " if res["uses_image"] else "") + (res["subject"] or row["subject"] or "Mixed")
+    return mcq, label
 
 
-async def make_auto_draft(context: ContextTypes.DEFAULT_TYPE, force: bool = False) -> str:
-    """Create one draft and DM it to the admin. Returns a short status line."""
+async def make_auto_draft(context: ContextTypes.DEFAULT_TYPE, force: bool = False,
+                          want_image: bool | None = None) -> str:
+    """Create one draft and DM it to the admin. Returns a short status line.
+    want_image: True = must try an image question, None = random by AUTO_IMAGE_PERCENT."""
     admin_id = _admin_id()
     if not admin_id:
         return "ADMIN_IDS is not set."
-    targets = _target_chats()
-    if not targets:
+    if not _target_chats():
         return "No group is set up. Add TARGET_CHAT_IDS in the host's environment variables."
 
     state = _state(context)
@@ -149,43 +164,59 @@ async def make_auto_draft(context: ContextTypes.DEFAULT_TYPE, force: bool = Fals
     if not force and _pending_count(context) >= AUTO_MAX_PENDING:
         return f"Paused: {AUTO_MAX_PENDING} draft(s) are waiting for your approval."
 
-    subject = _next_subject(state)
     level = _levels()[state["count"] % len(_levels())]
-    topic = f"{subject} (choose one high-yield topic from the standard syllabus; avoid the most obvious one)"
+    if want_image is None:
+        want_image = random.randint(1, 100) <= AUTO_IMAGE_PERCENT
 
-    try:
-        mcqs, _ = await generate_mcqs(topic, 1, level=level,
-                                      avoid=await _recent_questions(state, subject))
-    except GeminiError as e:
-        return await _record_failure(context, state, admin_id, str(e))
-    except Exception as e:
-        logger.exception("auto draft crashed")
-        return await _record_failure(context, state, admin_id, type(e).__name__)
+    mcq, label, subject, avoid = None, None, None, []
+
+    if want_image:
+        try:
+            made = await _image_draft(state, context.bot, level)
+            if made:
+                mcq, label = made
+                subject = mcq.get("subject") or "Image"
+            elif force:
+                return "The image bank is empty. Send me some images first (any photo you send me is saved)."
+        except GeminiError as e:
+            logger.warning(f"Auto image draft failed, using a text question instead: {e}")
+            if force:
+                return await _record_failure(context, state, admin_id, str(e))
+        except Exception:
+            logger.exception("auto image draft crashed; using a text question instead")
+
+    if mcq is None:
+        subject = _next_subject(state)
+        label = subject
+        topic = f"{subject} (choose one high-yield topic from the standard syllabus; avoid the most obvious one)"
+        avoid = await _recent_questions(state, subject)
+        try:
+            mcqs, _ = await generate_mcqs(topic, 1, level=level, avoid=avoid)
+        except GeminiError as e:
+            return await _record_failure(context, state, admin_id, str(e))
+        except Exception as e:
+            logger.exception("auto draft crashed")
+            return await _record_failure(context, state, admin_id, type(e).__name__)
+        mcq = mcqs[0]
+        mcq["subject"] = subject
+        draft_topic = topic
+    else:
+        draft_topic = subject
 
     state["fails"] = 0
     state["count"] += 1
-    mcq = mcqs[0]
     state["recent"].append(mcq["question"])
 
-    batch = uuid.uuid4().hex[:6]
-    titles = await _group_titles(context, targets)
-    data = {
-        "admin": admin_id, "chat_id": admin_id, "topic": subject,
-        "items": [{"mcq": mcq, "status": None, "msg_id": None}],
-        "targets": targets, "titles": titles, "selected": set(),
-        "auto": True, "created": time.time(),
-    }
-    _drafts(context)[batch] = data
-
-    header = f"⏰ Auto draft · {subject} · {level}\n👇 Tap the group to send it to\n\n"
+    header = f"⏰ Auto draft · {label} · {level}\n👇 Tap the group to send it to\n\n"
     try:
-        sent = await context.bot.send_message(
-            admin_id, header + _preview_text(0, 1, mcq), reply_markup=_auto_buttons(batch, data))
+        await send_single_draft(
+            context, admin_id, mcq, topic=draft_topic, level=level, header=header,
+            avoid=avoid or list(state["recent"]), auto=True)
+    except NoTargetGroups:
+        return "No group is set up. Add TARGET_CHAT_IDS in the host's environment variables."
     except Exception as e:
-        _drafts(context).pop(batch, None)
         logger.error(f"Could not DM the admin {admin_id}: {e}")
         return "Could not message the admin. Open the bot in Telegram and press Start first."
-    data["items"][0]["msg_id"] = sent.message_id
     return "ok"
 
 
@@ -276,17 +307,22 @@ async def auto_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         state["enabled"] = False
         await msg.reply_text("⏸ Auto drafts paused (they resume if the bot restarts; "
                              "set AUTO_GENERATE=0 on the host to keep them off).")
-    elif arg == "now":
+    elif arg in ("now", "image"):
         working = await msg.reply_text("🤖 Making a draft…")
-        result = await make_auto_draft(context, force=True)
+        result = await make_auto_draft(context, force=True, want_image=True if arg == "image" else None)
         await working.edit_text("✅ Draft sent above." if result == "ok" else f"❌ {result}")
     else:
+        try:
+            bank = await count_bank_images()
+        except Exception:
+            bank = "?"
         await msg.reply_text(
             f"⏰ Auto drafts: {'ON' if state['enabled'] else 'OFF'}\n"
             f"Every {AUTO_INTERVAL_MIN} min · {len(_subjects())} subjects · levels: {', '.join(_levels())}\n"
             f"Waiting for your approval: {_pending_count(context)}/{AUTO_MAX_PENDING}\n"
-            f"Drafted since last restart: {state['count']}\n\n"
-            "/auto on · /auto off · /auto now")
+            f"Drafted since last restart: {state['count']}\n"
+            f"🖼 Image questions: {AUTO_IMAGE_PERCENT}% of drafts · images in bank: {bank}\n\n"
+            "/auto on · /auto off · /auto now · /auto image")
 
 
 def schedule_auto(app: Application) -> None:
