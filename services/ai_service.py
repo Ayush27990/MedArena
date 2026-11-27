@@ -9,7 +9,9 @@ import re
 import logging
 import asyncio
 import httpx
-from config import GROQ_API_KEY, GROQ_MODEL_FAST, GROQ_MODEL_SMART, SUBJECTS, DIFFICULTIES
+from config import (
+    GROQ_API_KEY, GROQ_MODEL_FAST, GROQ_MODEL_SMART, SUBJECTS, DIFFICULTIES, groq_params,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -26,8 +28,8 @@ async def _call_groq(prompt: str, model: str = GROQ_MODEL_FAST,
     payload = {
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
-        "max_tokens": max_tokens,
         "temperature": 0.3,
+        **groq_params(model, max_tokens),
     }
     for attempt in range(retries):
         try:
@@ -175,8 +177,8 @@ Respond with ONLY the JSON array."""
                 }
             ]
         }],
-        "max_tokens": 2000,
         "temperature": 0.2,
+        **groq_params(GROQ_VISION_MODEL, 2000),
     }
     try:
         async with httpx.AsyncClient(timeout=60) as client:
