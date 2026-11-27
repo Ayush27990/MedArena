@@ -7,7 +7,7 @@ Optional: GEMINI_MODEL (default below), GEMINI_FALLBACK_MODEL, GROQ_VISION_MODEL
 What is in here
   generate_mcqs        text MCQs on a topic (or based on a source text/poll)
   reassess_mcq         double-check an MCQ and fix a wrong answer key
-  generate_image_mcq   ONE image-based MCQ written by looking at a real image
+  generate_image_mcqs  MCQs written by looking at a real image (and its caption)
 Every function takes provider="gemini" (default) or provider="other" (Groq),
 so the admin can ask a different AI for a second opinion.
 """
@@ -20,7 +20,7 @@ import asyncio
 import logging
 import httpx
 
-from config import GROQ_API_KEY, GROQ_MODEL_SMART, SUBJECTS
+from config import GROQ_API_KEY, GROQ_MODEL_SMART, SUBJECTS, groq_params
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +42,10 @@ MAX_EXPLANATION = 200
 
 class GeminiError(Exception):
     """Raised when the AI cannot produce MCQs. The message is safe to show the admin."""
+
+
+class _Unusable(GeminiError):
+    """The AI says the image/caption cannot be used: retrying will not help."""
 
 
 # ─────────────────────────────────────────────────────────────
@@ -97,10 +101,12 @@ Return ONLY a JSON array, no other text, no markdown. Each item:
 {{"question": "...", "options": ["...", "...", "...", "..."], "correct": "A", "explanation": "..."}}"""
 
 
-def _build_reassess_prompt(mcq: dict, has_image: bool) -> str:
+def _build_reassess_prompt(mcq: dict, has_image: bool, hint: str = "") -> str:
     opts = "\n".join(f"{l}. {o}" for l, o in zip("ABCD", mcq["options"]))
     image_line = ("\nThe question refers to the attached image. Look at it carefully and use it.\n"
                   if has_image else "")
+    if has_image and hint:
+        image_line += f'The image was sent with this caption; read them together: "{hint[:1024]}"\n'
     max_q = MAX_IMAGE_QUESTION if has_image else MAX_QUESTION
     return f"""You are a senior medical examiner double-checking an MCQ before it is published to students.
 {image_line}
@@ -123,21 +129,40 @@ Return ONLY one JSON object, no markdown:
 {{"verdict": "ok", "question": "...", "options": ["...", "...", "...", "..."], "correct": "A", "explanation": "...", "note": "..."}}"""
 
 
-def _build_image_prompt(hint: str, level: str | None, avoid: list[str] | None) -> str:
+def _caption_block(hint: str) -> str:
+    if not hint:
+        return "\n"
+    return f"""
+CAPTION sent together with the image:
+<<<
+{hint[:1024]}
+>>>
+Treat the image and the caption as ONE piece of material, never as two separate sources:
+1. First work out how they relate. The caption may give the clinical history, name the diagnosis or topic,
+   point to one part of the image, or ask for a particular kind of question.
+2. Read the image in the light of the caption (history + findings, or the part of the page the caption points to).
+3. Every question must use that link. For a medical picture, combine the caption's clues with what is visible,
+   so that the solver has to use both. For a page of text, focus on the part of the page the caption refers to.
+4. If the caption names the answer or diagnosis, do not reveal it in the question; ask about it or about its next step.
+5. If the caption clearly does not match the image, do not force a link: return {{"error": "caption does not match the image: <short reason>"}}.
+"""
+
+
+def _build_image_prompt(hint: str, level: str | None, avoid: list[str] | None, count: int = 1) -> str:
     exam, _ = _exam_and_style(level)
-    hint_line = f"\nThe admin added this note about the image: \"{hint[:500]}\"\n" if hint else "\n"
+    hint_line = _caption_block(hint)
     subjects = ", ".join(s for s in SUBJECTS if s != "Other")
-    return f"""You are an expert medical examiner writing an IMAGE-BASED MCQ for {exam} preparation.
+    return f"""You are an expert medical examiner writing an IMAGE-BASED MCQs for {exam} preparation.
 Look carefully at the attached image.{hint_line}
 Decide what kind of image it is:
 - A medical picture (clinical photo, X-ray, CT, MRI, ultrasound, ECG, fundus, histology/pathology slide, specimen,
-  instrument, structure, anatomy diagram, graph, flowchart, table): write ONE MCQ that CANNOT be answered without
+  instrument, structure, anatomy diagram, graph, flowchart, table): write MCQ(s) that CANNOT be answered without
   looking at the image, and set "uses_image": true.
-- Mostly text (notes, a screenshot of a question, a textbook page): set "uses_image": false and write ONE new MCQ
-  on the same concept. That question must make sense WITHOUT the image.
+- Mostly text (notes, a screenshot of a question, a textbook page): set "uses_image": false and write new MCQ(s)
+  on the same concepts. Such a question must make sense WITHOUT the image.
 
 Rules:
-- Use ONLY what is clearly visible/readable in the image (plus the admin's note). Never invent findings.
+- Use ONLY what is clearly visible/readable in the image (plus the caption). Never invent findings.
   If the image is too blurry, cropped or unclear for a reliable question, return {{"error": "short reason"}} instead.
 - If the image has arrows or labels, refer to them naturally ("the structure marked by the arrows").
 - Never reveal the answer inside the question text.
@@ -149,8 +174,11 @@ Rules:
 - "topic": a short specific topic, at most 60 characters.
 - Be factually accurate according to standard textbooks.{_avoid_block(avoid)}
 
-Return ONLY one JSON object, no markdown:
-{{"uses_image": true, "subject": "...", "topic": "...", "question": "...", "options": ["...", "...", "...", "..."], "correct": "A", "explanation": "..."}}"""
+Write exactly {count} MCQ(s). Each must test a DIFFERENT point (for example: identification, mechanism,
+associated finding, investigation, management). The instructions above apply to every one of them.
+
+Return ONLY a JSON array with {count} item(s), no markdown (or only the {{"error": ...}} object):
+[{{"uses_image": true, "subject": "...", "topic": "...", "question": "...", "options": ["...", "...", "...", "..."], "correct": "A", "explanation": "..."}}]"""
 
 
 # ─────────────────────────────────────────────────────────────
@@ -311,6 +339,8 @@ async def _ask_groq(prompt: str, image: bytes | None, mime: str, temperature: fl
     if not GROQ_API_KEY:
         raise GeminiError("GROQ_API_KEY is not set on the host, so the second AI is not available.")
 
+    if mime == "application/pdf" and image:
+        raise GeminiError("Groq cannot read PDF files directly.")
     model = GROQ_VISION_MODEL if image else GROQ_MODEL_SMART
     if image:
         content = [
@@ -323,7 +353,7 @@ async def _ask_groq(prompt: str, image: bytes | None, mime: str, temperature: fl
 
     headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
     payload = {"model": model, "messages": [{"role": "user", "content": content}],
-               "max_tokens": 2000, "temperature": min(temperature, 0.5)}
+               "temperature": min(temperature, 0.6), **groq_params(model, 4000)}
     waits = [2, 4, 8]
     last_error = "Groq is busy right now. Please try again in a minute."
 
@@ -371,36 +401,62 @@ async def _ask(prompt: str, provider: str = "gemini", image: bytes | None = None
 
 async def generate_mcqs(topic: str, count: int = 5, level: str | None = None,
                         avoid: list[str] | None = None, source: str | None = None,
-                        provider: str = "gemini") -> tuple[list[dict], int]:
+                        provider: str = "gemini", pdf: bytes | None = None,
+                        hint: str = "") -> tuple[list[dict], int]:
     """
-    Ask the AI for `count` MCQs on `topic` (optionally guided by `source` text).
-    Returns (mcqs, dropped) where dropped = how many items were unusable.
-    Raises GeminiError with a readable message on failure.
+    Ask the AI for `count` MCQs on `topic` (optionally guided by `source` text or a PDF).
+    If some come back unusable, it asks again for just the missing ones.
+    Returns (mcqs, dropped). Raises GeminiError only if it got no usable question at all.
     """
-    prompt = _build_prompt(topic, count, level, avoid, source)
+    got: list[dict] = []
+    dropped = 0
     last = GeminiError("The questions were not usable. Please try again.")
-    for attempt in range(2):
-        text = await _ask(prompt, provider)
+    for attempt in range(3):
+        need = count - len(got)
+        seen = [m["question"] for m in got] + list(avoid or [])
+        prompt = _build_prompt(topic, need, level, seen, source)
+        if pdf:
+            prompt += (
+                "\n\nThe SOURCE MATERIAL is the attached PDF. It may be notes (typed, scanned or handwritten) "
+                "with no MCQs in it. Read all pages, including handwriting, tables and diagrams, and write NEW "
+                "MCQs from what it teaches, spread across different sections. Every question must make sense "
+                "without seeing the PDF.")
+            if hint:
+                prompt += (f"\nThe admin sent this caption with the PDF; follow it when choosing what to ask: "
+                           f"\"{hint[:1024]}\"")
         try:
+            if pdf:
+                text = await _ask(prompt, provider, image=pdf, mime="application/pdf")
+            else:
+                text = await _ask(prompt, provider)
             items = _extract_json_array(text)
         except GeminiError as e:
             last = e
+            if got:
+                break
+            if attempt == 2:
+                break
             await asyncio.sleep(1)
             continue
-        good, dropped = _clean_mcqs(items)
-        if good:
-            return good, dropped
+        good, bad = _clean_mcqs(items)
+        dropped += bad
+        have = {m["question"].lower() for m in got}
+        got += [m for m in good if m["question"].lower() not in have]
+        if len(got) >= count:
+            break
         last = GeminiError("The AI's questions were not usable. Please try again.")
+    if got:
+        return got[:count], dropped
     raise last
 
 
 async def reassess_mcq(mcq: dict, provider: str = "gemini",
-                       image: bytes | None = None) -> tuple[dict, str]:
+                       image: bytes | None = None, hint: str = "") -> tuple[dict, str]:
     """
     Ask the AI to double-check an MCQ (and fix a wrong answer key).
     Returns (fixed_mcq, note). fixed_mcq only has question/options/correct/explanation.
     """
-    prompt = _build_reassess_prompt(mcq, bool(image))
+    prompt = _build_reassess_prompt(mcq, bool(image), hint)
     max_q = MAX_IMAGE_QUESTION if image else MAX_QUESTION
     last = GeminiError("The re-check was not usable. Please try again.")
     for attempt in range(2):
@@ -418,35 +474,62 @@ async def reassess_mcq(mcq: dict, provider: str = "gemini",
     raise last
 
 
-async def generate_image_mcq(image: bytes, mime: str = "image/jpeg", hint: str = "",
-                             level: str | None = None, avoid: list[str] | None = None,
-                             provider: str = "gemini") -> dict:
+async def generate_image_mcqs(image: bytes, count: int = 4, mime: str = "image/jpeg", hint: str = "",
+                              level: str | None = None, avoid: list[str] | None = None,
+                              provider: str = "gemini") -> list[dict]:
     """
-    Write ONE MCQ by looking at a real image.
-    Returns {question, options, correct, explanation, uses_image, subject, topic}.
-    uses_image=False means the image was just text/notes and the question works without it.
-    Raises GeminiError (also when the image is too unclear).
+    Write `count` MCQs by looking at a real image (linked to its caption, if any).
+    Each item: {question, options, correct, explanation, uses_image, subject, topic}.
+    uses_image=False means the question works without the picture (e.g. a page of notes).
+    Raises GeminiError (also when the image is too unclear or the caption does not match).
     """
-    prompt = _build_image_prompt(hint, level, avoid)
+    got: list[dict] = []
     last = GeminiError("The image question was not usable. Please try again.")
-    for attempt in range(2):
-        text = await _ask(prompt, provider, image=image, mime=mime, temperature=0.5)
+    for attempt in range(3):
+        need = count - len(got)
+        seen = [m["question"] for m in got] + list(avoid or [])
+        prompt = _build_image_prompt(hint, level, seen, need)
         try:
-            obj = _extract_json_object(text)
+            text = _strip_noise(await _ask(prompt, provider, image=image, mime=mime, temperature=0.5))
+            first_brace, first_bracket = text.find("{"), text.find("[")
+            if first_brace != -1 and (first_bracket == -1 or first_brace < first_bracket):
+                obj = _extract_json_object(text)
+                if obj.get("error"):
+                    if got:
+                        break
+                    raise _Unusable(f"This image can't be used for a question: {str(obj['error'])[:200]}")
+                items = [obj]
+            else:
+                items = _extract_json_array(text)
+        except _Unusable:
+            raise
         except GeminiError as e:
             last = e
+            if got or attempt == 2:
+                break
             await asyncio.sleep(1)
             continue
 
-        if obj.get("error"):
-            raise GeminiError(f"This image can't be used for a question: {str(obj['error'])[:150]}")
-
-        uses_image = obj.get("uses_image") not in (False, "false", "False", 0)
-        mcq = _clean_one(obj, MAX_IMAGE_QUESTION if uses_image else MAX_QUESTION)
-        if mcq:
-            mcq["uses_image"] = uses_image
-            mcq["subject"] = _match_subject(obj.get("subject"))
-            mcq["topic"] = str(obj.get("topic", "") or "").strip()[:60]
-            return mcq
-        last = GeminiError("The AI's image question was not usable. Please try again.")
+        for obj in items:
+            if not isinstance(obj, dict):
+                continue
+            uses_image = obj.get("uses_image") not in (False, "false", "False", 0)
+            mcq = _clean_one(obj, MAX_IMAGE_QUESTION if uses_image else MAX_QUESTION)
+            if mcq and mcq["question"].lower() not in {m["question"].lower() for m in got}:
+                mcq["uses_image"] = uses_image
+                mcq["subject"] = _match_subject(obj.get("subject"))
+                mcq["topic"] = str(obj.get("topic", "") or "").strip()[:60]
+                got.append(mcq)
+        if len(got) >= count:
+            break
+        last = GeminiError("The AI's image questions were not usable. Please try again.")
+    if got:
+        return got[:count]
     raise last
+
+
+async def generate_image_mcq(image: bytes, mime: str = "image/jpeg", hint: str = "",
+                             level: str | None = None, avoid: list[str] | None = None,
+                             provider: str = "gemini") -> dict:
+    """ONE image question (used by battle mode)."""
+    return (await generate_image_mcqs(image, 1, mime, hint, level, avoid, provider))[0]
