@@ -19,16 +19,16 @@ from config import BOT_TOKEN
 from handlers.start import start_handler, help_handler
 
 from handlers.import_mcq import (
-    handle_document,
     handle_explanation_text
 )
 
-# Polls / text / images sent by an admin in a private chat become AI drafts
+# Polls / text / images / PDFs sent by an admin in a private chat become AI drafts
 # (with "send to group" approval). Everything else still uses the old importer.
 from handlers.source_draft import (
     source_poll_handler,
     source_text_mcq_handler,
     source_photo_handler,
+    source_pdf_handler,
     handle_source_text
 )
 
@@ -80,7 +80,6 @@ from handlers.generate import (
 
 from handlers.auto_generate import (
     auto_handler,
-    auto_send_callback,
     schedule_auto
 )
 
@@ -202,7 +201,7 @@ def main():
     )
 
     app.add_handler(
-        MessageHandler(filters.Document.PDF, handle_document)
+        MessageHandler(filters.Document.PDF, source_pdf_handler)
     )
 
     app.add_handler(
@@ -296,17 +295,10 @@ def main():
         )
     )
 
-    # AUTO GENERATION CALLBACKS
-    app.add_handler(
-        CallbackQueryHandler(
-            auto_send_callback,
-            pattern=r'^agen\|'
-        )
-    )
-
     logger.info("MedArena bot starting...")
 
-    app.run_polling(drop_pending_updates=True)
+    # False: messages you send while the bot is restarting are handled when it is back.
+    app.run_polling(drop_pending_updates=False)
 
 
 if __name__ == "__main__":
