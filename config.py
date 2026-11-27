@@ -41,8 +41,22 @@ DATABASE_URL = os.getenv(
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 
-GROQ_MODEL_FAST = "llama-3.1-8b-instant"
-GROQ_MODEL_SMART = "llama-3.3-70b-versatile"
+# Groq shut down llama-3.1-8b-instant and llama-3.3-70b-versatile (free/developer
+# plans) on 16 Aug 2026. These are its recommended replacements. If Groq retires
+# them too, change the model with an environment variable - no code edit needed.
+GROQ_MODEL_FAST = os.getenv("GROQ_MODEL_FAST", "").strip() or "openai/gpt-oss-20b"
+GROQ_MODEL_SMART = os.getenv("GROQ_MODEL_SMART", "").strip() or "openai/gpt-oss-120b"
+
+
+def groq_params(model: str, answer_tokens: int) -> dict:
+    """Extra request fields. These models "think" first, and thinking uses up output tokens."""
+    if model.startswith("openai/gpt-oss"):
+        return {"max_completion_tokens": answer_tokens + 1500,
+                "reasoning_effort": "low", "include_reasoning": False}
+    if model.startswith("qwen/"):
+        return {"max_completion_tokens": answer_tokens,
+                "reasoning_effort": "none"}
+    return {"max_completion_tokens": answer_tokens}
 
 # --------------------------------------------------
 # GEMINI AI

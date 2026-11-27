@@ -1,31 +1,28 @@
 """
-Automatic MCQ drafts (every 15 minutes by default).
+Automatic MCQ drafts.
 
-Every AUTO_INTERVAL_MIN minutes the bot asks Gemini for ONE exam-level MCQ,
-rotating through the subjects and alternating NEET PG / USMLE level, and sends
-it to the admin's private chat with one button per group.
+Every AUTO_INTERVAL_MIN minutes the bot writes a batch of AUTO_DRAFT_COUNT MCQs
+(one subject per batch, rotating; alternating NEET PG / USMLE) and sends them to
+the admin's private chat. Nothing is posted until you tap a Send button.
+If Gemini fails (for example its daily limit is used up), Groq writes the batch.
 
-Some drafts (AUTO_IMAGE_PERCENT, default 30%) are IMAGE questions: the bot takes a real
-image from the image bank (every image you send the bot is saved there), Gemini looks at
-it and writes the question, and the group gets it as photo + quiz poll.
-Every draft also has Reassess / Regenerate buttons (Gemini or Groq).
-
-Nothing is posted anywhere until the admin taps a group button (or "All groups").
-The MCQ is then posted as a quiz poll to the chosen group(s) and saved
-(approved) in the database for future quizzes. "Skip" discards the draft and
-saves nothing.
+Some batches (AUTO_IMAGE_PERCENT) use a picture from the image bank.
 
 Admin command (private chat):
-  /auto            status
-  /auto on | off   resume / pause (until the bot restarts)
-  /auto now        make one draft right now
-  /auto image      make one IMAGE draft right now
+  /auto              status (also shows how long the bot has been running)
+  /auto on | off     resume / pause
+  /auto every 30     change the interval (minutes)
+  /auto now          make a batch right now
+  /auto image        make an IMAGE batch right now
+  /auto clear        discard all waiting auto drafts
 
-Optional environment variables:
+/auto changes last until the bot restarts. For permanent settings use the
+environment variables:
   AUTO_GENERATE      1 (default) or 0 - start switched on or off
-  AUTO_INTERVAL_MIN  minutes between drafts (default 15)
-  AUTO_MAX_PENDING   stop making new drafts while this many wait for you (default 3)
-  AUTO_IMAGE_PERCENT chance (0-100) that a draft is an image question (default 30)
+  AUTO_INTERVAL_MIN  minutes between batches (default 15)
+  AUTO_DRAFT_COUNT   questions per batch (default 4)
+  AUTO_MAX_PENDING   stop while this many BATCHES wait for you (default 6)
+  AUTO_IMAGE_PERCENT chance (0-100) that a batch is image-based (default 30)
   AUTO_SUBJECTS      comma-separated subjects (default: all subjects in config.py)
   AUTO_LEVELS        comma-separated, alternated (default: NEET PG,USMLE)
   AUTO_ADMIN_ID      who receives the drafts (default: first id in ADMIN_IDS)
@@ -33,18 +30,17 @@ Optional environment variables:
 
 import os
 import time
-import uuid
 import random
 import logging
 from collections import deque
 from telegram import Update
 from telegram.ext import Application, ContextTypes
 from config import ADMIN_IDS, SUBJECTS
-from services.gemini_service import generate_mcqs, generate_image_mcq, GeminiError
+from services.gemini_service import generate_mcqs, generate_image_mcqs, GeminiError
 from services.database import search_mcqs, pick_bank_images, bump_bank_image, count_bank_images
 from handlers.generate import (
-    _drafts, _preview_text, _target_chats, _post_to_groups, _clear_buttons,
-    send_single_draft, download_file, pick_layout, NoTargetGroups,
+    _drafts, _target_chats, _waiting, prune_drafts,
+    send_drafts, download_file, pick_layout, NoTargetGroups,
 )
 
 logger = logging.getLogger(__name__)
@@ -58,13 +54,14 @@ def _env_int(name: str, default: int) -> int:
 
 
 AUTO_INTERVAL_MIN = _env_int("AUTO_INTERVAL_MIN", 15)
-AUTO_MAX_PENDING = _env_int("AUTO_MAX_PENDING", 3)
+AUTO_DRAFT_COUNT = min(10, _env_int("AUTO_DRAFT_COUNT", 4))
+AUTO_MAX_PENDING = _env_int("AUTO_MAX_PENDING", 6)
+STARTED_AT = time.time()
 try:
     AUTO_IMAGE_PERCENT = min(100, max(0, int(os.getenv("AUTO_IMAGE_PERCENT", "").strip() or 30)))
 except ValueError:
     AUTO_IMAGE_PERCENT = 30
 AUTO_START_ON = os.getenv("AUTO_GENERATE", "1").strip().lower() not in ("0", "off", "false", "no")
-DRAFT_TTL_SECONDS = 24 * 3600
 FAILS_BEFORE_ALERT = 3
 
 
@@ -88,7 +85,8 @@ def _admin_id() -> int | None:
 def _state(context: ContextTypes.DEFAULT_TYPE) -> dict:
     return context.bot_data.setdefault("auto_state", {
         "enabled": AUTO_START_ON, "queue": [], "count": 0,
-        "fails": 0, "recent": deque(maxlen=12), "titles": {},
+        "fails": 0, "recent": deque(maxlen=24), "interval": AUTO_INTERVAL_MIN,
+        "told_full": False, "last_ok": None, "last_result": "no run yet", "running": False,
     })
 
 
@@ -101,19 +99,8 @@ def _next_subject(state: dict) -> str:
 
 
 def _pending_count(context: ContextTypes.DEFAULT_TYPE) -> int:
-    return sum(
-        1 for d in _drafts(context).values()
-        if d.get("auto") and any(i["status"] is None for i in d["items"])
-    )
-
-
-def _prune(context: ContextTypes.DEFAULT_TYPE) -> None:
-    drafts = _drafts(context)
-    now = time.time()
-    for batch in [b for b, d in drafts.items() if d.get("flow") == "single" and (
-            now - d.get("created", now) > DRAFT_TTL_SECONDS
-            or all(i["status"] is not None for i in d["items"]))]:
-        drafts.pop(batch, None)
+    """Auto batches that still have a draft waiting."""
+    return sum(1 for d in _drafts(context).values() if d.get("auto") and _waiting(d))
 
 
 async def _recent_questions(state: dict, subject: str) -> list[str]:
@@ -127,8 +114,8 @@ async def _recent_questions(state: dict, subject: str) -> list[str]:
     return seen
 
 
-async def _image_draft(state: dict, bot, level: str):
-    """Try to build an IMAGE question from the image bank. Returns (mcq, label) or None."""
+async def _image_batch(state: dict, bot, level: str, provider: str = "gemini"):
+    """Try to build IMAGE questions from one bank image. Returns (mcqs, label, image_id) or None."""
     rows = await pick_bank_images(1)
     if not rows:
         return None
@@ -138,131 +125,114 @@ async def _image_draft(state: dict, bot, level: str):
     except Exception:
         logger.exception("Could not download image-bank image %s", row["id"])
         return None
-    res = await generate_image_mcq(image, level=level, avoid=list(state["recent"]))
+    results = await generate_image_mcqs(
+        image, AUTO_DRAFT_COUNT, level=level, avoid=list(state["recent"]), provider=provider)
     await bump_bank_image(row["id"])
 
-    mcq = {k: res[k] for k in ("question", "options", "correct", "explanation", "subject", "topic")}
-    if res["uses_image"]:
-        mcq["image_file_id"] = row["file_id"]
-        mcq["layout"] = pick_layout(mcq["question"])
-    label = ("🖼 Image · " if res["uses_image"] else "") + (res["subject"] or row["subject"] or "Mixed")
-    return mcq, label
+    mcqs = []
+    for res in results:
+        mcq = {k: res[k] for k in ("question", "options", "correct", "explanation", "subject", "topic")}
+        if res["uses_image"]:
+            mcq["image_file_id"] = row["file_id"]
+            mcq["layout"] = pick_layout(mcq["question"])
+        mcqs.append(mcq)
+    label = "🖼 Image · " + (results[0]["subject"] or row["subject"] or "Mixed")
+    return mcqs, label, row["file_id"]
 
 
 async def make_auto_draft(context: ContextTypes.DEFAULT_TYPE, force: bool = False,
                           want_image: bool | None = None) -> str:
-    """Create one draft and DM it to the admin. Returns a short status line.
-    want_image: True = must try an image question, None = random by AUTO_IMAGE_PERCENT."""
+    """Create one batch and DM it to the admin. Returns "ok" or a short status line.
+    want_image: True = must try an image batch, None = random by AUTO_IMAGE_PERCENT."""
+    state = _state(context)
+    if state["running"]:
+        return "A batch is already being made."
+    state["running"] = True
+    try:
+        result = await _make_batch(context, state, force, want_image)
+    finally:
+        state["running"] = False
+    state["last_result"] = result
+    if result == "ok":
+        state["last_ok"] = time.time()
+    return result
+
+
+async def _make_batch(context, state: dict, force: bool, want_image: bool | None) -> str:
     admin_id = _admin_id()
     if not admin_id:
         return "ADMIN_IDS is not set."
     if not _target_chats():
         return "No group is set up. Add TARGET_CHAT_IDS in the host's environment variables."
 
-    state = _state(context)
-    _prune(context)
+    prune_drafts(context)
     if not force and _pending_count(context) >= AUTO_MAX_PENDING:
-        return f"Paused: {AUTO_MAX_PENDING} draft(s) are waiting for your approval."
+        if not state["told_full"]:
+            try:
+                await context.bot.send_message(
+                    admin_id, f"⏸ Auto drafts are waiting: {AUTO_MAX_PENDING} batches need your decision.\n"
+                              "Send or skip them, or use /auto clear. New batches then start again.")
+                state["told_full"] = True
+            except Exception:
+                logger.exception("Could not tell the admin the queue is full")
+        return f"Waiting: {AUTO_MAX_PENDING} batch(es) need your approval."
+    state["told_full"] = False
 
     level = _levels()[state["count"] % len(_levels())]
     if want_image is None:
         want_image = random.randint(1, 100) <= AUTO_IMAGE_PERCENT
 
-    mcq, label, subject, avoid = None, None, None, []
+    mcqs, label, image_id, avoid, topic, used = None, None, None, [], None, ""
 
     if want_image:
         try:
-            made = await _image_draft(state, context.bot, level)
+            made = await _image_batch(state, context.bot, level)
             if made:
-                mcq, label = made
-                subject = mcq.get("subject") or "Image"
+                mcqs, label, image_id = made
+                topic = mcqs[0].get("subject") or "Image"
             elif force:
                 return "The image bank is empty. Send me some images first (any photo you send me is saved)."
         except GeminiError as e:
-            logger.warning(f"Auto image draft failed, using a text question instead: {e}")
-            if force:
-                return await _record_failure(context, state, admin_id, str(e))
+            logger.warning(f"Auto image batch failed, using text questions instead: {e}")
         except Exception:
-            logger.exception("auto image draft crashed; using a text question instead")
+            logger.exception("auto image batch crashed; using text questions instead")
 
-    if mcq is None:
+    if mcqs is None:
         subject = _next_subject(state)
         label = subject
-        topic = f"{subject} (choose one high-yield topic from the standard syllabus; avoid the most obvious one)"
+        topic = f"{subject} (choose high-yield topics from the standard syllabus; avoid the most obvious ones)"
         avoid = await _recent_questions(state, subject)
-        try:
-            mcqs, _ = await generate_mcqs(topic, 1, level=level, avoid=avoid)
-        except GeminiError as e:
-            return await _record_failure(context, state, admin_id, str(e))
-        except Exception as e:
-            logger.exception("auto draft crashed")
-            return await _record_failure(context, state, admin_id, type(e).__name__)
-        mcq = mcqs[0]
-        mcq["subject"] = subject
-        draft_topic = topic
-    else:
-        draft_topic = subject
+        errors = []
+        for provider in ("gemini", "other"):
+            try:
+                mcqs, _ = await generate_mcqs(topic, AUTO_DRAFT_COUNT, level=level, avoid=avoid, provider=provider)
+                if provider == "other":
+                    used = f"✍️ Written by Groq (Gemini failed: {errors[0][:120]})\n"
+                break
+            except GeminiError as e:
+                errors.append(str(e))
+            except Exception as e:
+                logger.exception("auto draft crashed")
+                errors.append(type(e).__name__)
+        if mcqs is None:
+            return await _record_failure(context, state, admin_id, " | ".join(errors))
+        for m in mcqs:
+            m["subject"] = subject
 
-    state["fails"] = 0
-    state["count"] += 1
-    state["recent"].append(mcq["question"])
-
-    header = f"⏰ Auto draft · {label} · {level}\n👇 Tap the group to send it to\n\n"
+    header = f"⏰ Auto draft · {label} · {level}\n{used}\n"
     try:
-        await send_single_draft(
-            context, admin_id, mcq, topic=draft_topic, level=level, header=header,
-            avoid=avoid or list(state["recent"]), auto=True)
+        await send_drafts(
+            context, admin_id, mcqs, topic=topic, level=level, header=header,
+            avoid=avoid or list(state["recent"]), auto=True, source_image_id=image_id)
     except NoTargetGroups:
         return "No group is set up. Add TARGET_CHAT_IDS in the host's environment variables."
     except Exception as e:
         logger.error(f"Could not DM the admin {admin_id}: {e}")
         return "Could not message the admin. Open the bot in Telegram and press Start first."
+    state["fails"] = 0
+    state["count"] += 1
+    state["recent"].extend(m["question"] for m in mcqs)
     return "ok"
-
-
-async def auto_send_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Admin tapped a group button on an auto draft: post there and save to the database."""
-    q = update.callback_query
-    if not q or not q.data:
-        return
-    if q.from_user.id not in ADMIN_IDS:
-        await q.answer("Admins only.", show_alert=True)
-        return
-    parts = q.data.split("|")
-    if len(parts) != 3:
-        await q.answer()
-        return
-    _, batch, which = parts
-    data = _drafts(context).get(batch)
-    if not data:
-        await q.answer("This draft expired (the bot restarted). Wait for the next one.", show_alert=True)
-        try:
-            await q.edit_message_reply_markup(reply_markup=None)
-        except Exception:
-            pass
-        return
-    item = data["items"][0]
-    if item["status"]:
-        await q.answer("Already handled.")
-        return
-    try:
-        chats = list(data["targets"]) if which == "all" else [data["targets"][int(which)]]
-    except (ValueError, IndexError):
-        await q.answer()
-        return
-
-    await q.answer("Sending…")
-    ok, failed = await _post_to_groups(context, item["mcq"], q.from_user.id, chats)
-    if ok:
-        item["status"] = "sent"
-        names = ", ".join(str(data["titles"].get(c, c)) for c in chats if c not in failed)
-        tail = f"\n\n✅ Sent to {names}"
-        if failed:
-            tail += f"\n⚠️ Could not post to: {', '.join(map(str, failed))} (is the bot an admin there?)"
-        await _clear_buttons(context, data["chat_id"], item["msg_id"], _preview_text(0, 1, item["mcq"]) + tail)
-    else:
-        await context.bot.send_message(
-            data["chat_id"], "⚠️ Could not post. Make sure the bot is in the group and allowed to post polls, then tap again.")
 
 
 async def _record_failure(context, state: dict, admin_id: int, reason: str) -> str:
@@ -302,32 +272,72 @@ async def auto_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if arg == "on":
         state["enabled"] = True
-        await msg.reply_text(f"✅ Auto drafts ON — one every {AUTO_INTERVAL_MIN} min.")
+        await msg.reply_text(f"✅ Auto drafts ON: {AUTO_DRAFT_COUNT} questions every {state['interval']} min.")
     elif arg == "off":
         state["enabled"] = False
         await msg.reply_text("⏸ Auto drafts paused (they resume if the bot restarts; "
                              "set AUTO_GENERATE=0 on the host to keep them off).")
+    elif arg == "every":
+        value = context.args[1] if len(context.args) > 1 else ""
+        if not value.isdigit() or not 5 <= int(value) <= 1440:
+            await msg.reply_text("Use it like this: /auto every 30  (5 to 1440 minutes)")
+        elif context.job_queue is None:
+            await msg.reply_text("❌ The scheduler is not installed on the host.")
+        else:
+            state["interval"], state["enabled"] = int(value), True
+            _schedule(context.job_queue, int(value), int(value) * 60)
+            await msg.reply_text(f"✅ Auto drafts every {value} min (until restart; "
+                                 f"set AUTO_INTERVAL_MIN={value} on the host to keep it).")
+    elif arg == "clear":
+        drafts = _drafts(context)
+        old = [b for b, d in drafts.items() if d.get("auto")]
+        for batch in old:
+            drafts.pop(batch)
+        state["told_full"] = False
+        await msg.reply_text(f"🧹 Discarded {len(old)} auto batch(es).")
     elif arg in ("now", "image"):
-        working = await msg.reply_text("🤖 Making a draft…")
+        working = await msg.reply_text("🤖 Making drafts…")
         result = await make_auto_draft(context, force=True, want_image=True if arg == "image" else None)
-        await working.edit_text("✅ Draft sent above." if result == "ok" else f"❌ {result}")
+        await working.edit_text("✅ Drafts sent above." if result == "ok" else f"❌ {result}")
     else:
         try:
             bank = await count_bank_images()
         except Exception:
             bank = "?"
+        if context.job_queue is None:
+            next_line = "⚠️ Scheduler is NOT installed (check requirements.txt)"
+        else:
+            jobs = context.job_queue.get_jobs_by_name("auto_mcq")
+            if jobs and jobs[0].next_t:
+                mins = max(0, int((jobs[0].next_t.timestamp() - time.time()) // 60))
+                next_line = f"Next run in about {mins} min"
+            else:
+                next_line = "⚠️ No run is scheduled"
+        last = "never" if not state["last_ok"] else f"{int((time.time() - state['last_ok']) // 60)} min ago"
         await msg.reply_text(
             f"⏰ Auto drafts: {'ON' if state['enabled'] else 'OFF'}\n"
-            f"Every {AUTO_INTERVAL_MIN} min · {len(_subjects())} subjects · levels: {', '.join(_levels())}\n"
-            f"Waiting for your approval: {_pending_count(context)}/{AUTO_MAX_PENDING}\n"
-            f"Drafted since last restart: {state['count']}\n"
-            f"🖼 Image questions: {AUTO_IMAGE_PERCENT}% of drafts · images in bank: {bank}\n\n"
-            "/auto on · /auto off · /auto now · /auto image")
+            f"{AUTO_DRAFT_COUNT} questions every {state['interval']} min · {next_line}\n"
+            f"🟢 Bot running for {int((time.time() - STARTED_AT) // 60)} min\n"
+            f"Last successful batch: {last}\n"
+            f"Last result: {state['last_result']}\n"
+            f"Waiting for approval: {_pending_count(context)}/{AUTO_MAX_PENDING} batches\n"
+            f"Batches since restart: {state['count']}\n"
+            f"🖼 Image batches: {AUTO_IMAGE_PERCENT}% · images in bank: {bank}\n\n"
+            "/auto on · off · every 30 · now · image · clear")
+
+
+def _schedule(job_queue, minutes: int, first: int) -> None:
+    for job in job_queue.get_jobs_by_name("auto_mcq"):
+        job.schedule_removal()
+    # By default a job that starts even 1 second late is silently skipped; allow 5 minutes.
+    job_queue.run_repeating(
+        auto_job, interval=minutes * 60, first=first, name="auto_mcq",
+        job_kwargs={"misfire_grace_time": 300, "coalesce": True})
 
 
 def schedule_auto(app: Application) -> None:
     if app.job_queue is None:
         logger.warning("JobQueue is missing (install python-telegram-bot[job-queue]); auto drafts disabled.")
         return
-    app.job_queue.run_repeating(auto_job, interval=AUTO_INTERVAL_MIN * 60, first=60, name="auto_mcq")
+    _schedule(app.job_queue, AUTO_INTERVAL_MIN, 60)
     logger.info(f"Auto drafts scheduled every {AUTO_INTERVAL_MIN} min (start {'ON' if AUTO_START_ON else 'OFF'})")
