@@ -1,25 +1,25 @@
 """
-AI MCQ generator with admin approval.
+AI MCQ drafts with admin approval - the shared core.
 
 /generate [count] topic     (admins only, in a private chat with the bot)
   e.g.  /generate 5 Pharmacology antibiotics
 
-The AI writes the MCQs, the bot shows each one to the admin as a preview,
-and NOTHING is posted to a group until the admin taps "Send to group".
-Approved MCQs are posted as Telegram quiz polls and also saved in the database.
+EVERY draft, whatever made it (/generate, auto drafts, polls, text, images, PDFs),
+works the same way:
+  - tap group names to tick one or several, then "Send to selected"
+  - when there are 2+ drafts, a last message sends ALL waiting drafts to the ticked groups
+Nothing is posted until you tap a Send button.
 
-Every draft (here, in /auto, and for polls/text/images you send the bot) has:
+Each draft also has:
   🔍 Reassess  - an AI re-solves the question and fixes a wrong answer key
-  🔄 Regenerate - an AI writes a fresh question on the same topic / image
-each with "Gemini" (same AI) or "Groq" (a different AI) so you can get a second opinion.
-Image drafts also get a "Change layout" button.
-
-This file is the shared core: auto_generate.py and source_draft.py reuse it.
+  🔄 Regenerate - an AI writes a fresh question from the same source
+each with "Gemini" or "Groq". Image drafts also get a "Change layout" button.
 
 Groups to choose from: TARGET_CHAT_IDS env var (comma-separated).
 If TARGET_CHAT_IDS is empty, SOURCE_CHAT_IDS is used instead.
 """
 
+import io
 import os
 import time
 import uuid
@@ -29,7 +29,7 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Poll
 from telegram.ext import ContextTypes
 from config import ADMIN_IDS, SOURCE_CHAT_IDS
 from services.gemini_service import (
-    generate_mcqs, reassess_mcq, generate_image_mcq, GeminiError, PROVIDER_LABELS,
+    generate_mcqs, reassess_mcq, generate_image_mcqs, GeminiError, PROVIDER_LABELS,
 )
 from handlers.import_mcq import _process_mcq_dict
 
@@ -40,6 +40,7 @@ MAX_COUNT = 10
 
 POLL_QUESTION_LIMIT = 300
 CAPTION_LIMIT = 1024
+DRAFT_TTL_SECONDS = 24 * 3600
 CHOOSE_TEXT = "Choose the correct answer 👆"
 
 # How an image question is posted in a group
@@ -117,30 +118,31 @@ def _title(data: dict, chat_id: int) -> str:
     return data["titles"].get(chat_id) or str(chat_id)
 
 
-def _selector_text(data: dict) -> str:
-    chosen = [_title(data, c) for c in data["targets"] if c in data["selected"]]
-    shown = ", ".join(chosen) if chosen else "none yet"
-    return f"📍 Which group should get these MCQs?\nTap to select (tap again to unselect).\n\nSelected: {shown}"
-
-
-def _selector_markup(batch: str, data: dict) -> InlineKeyboardMarkup:
-    rows = []
-    for i, cid in enumerate(data["targets"]):
-        mark = "✅" if cid in data["selected"] else "▫️"
-        rows.append([InlineKeyboardButton(f"{mark} {_title(data, cid)}"[:60], callback_data=f"gen_g|{batch}|{i}")])
-    if len(data["targets"]) > 1:
-        all_on = len(data["selected"]) == len(data["targets"])
-        rows.append([InlineKeyboardButton(("✅" if all_on else "▫️") + " All groups", callback_data=f"gen_g|{batch}|all")])
-    return InlineKeyboardMarkup(rows)
-
-
-def _selected_chats(data: dict) -> list[int]:
-    return [c for c in data["targets"] if c in data["selected"]]
+def pdf_text(pdf: bytes) -> str:
+    """Typed text inside a PDF ('' for scanned/handwritten pages or if it can't be read)."""
+    try:
+        import pypdf
+        return "\n".join(p.extract_text() or "" for p in pypdf.PdfReader(io.BytesIO(pdf)).pages).strip()
+    except Exception:
+        logger.exception("Could not extract text from the PDF")
+        return ""
 
 
 # ─────────────────────────────────────────────────────────────
 # Buttons
 # ─────────────────────────────────────────────────────────────
+
+def _group_rows(data: dict, selected: set, make_data) -> list[list[InlineKeyboardButton]]:
+    """One tick box per group, plus 'Select all'."""
+    rows = []
+    for i, cid in enumerate(data["targets"]):
+        mark = "✅" if cid in selected else "⬜"
+        rows.append([InlineKeyboardButton(f"{mark} {_title(data, cid)}"[:60], callback_data=make_data(i))])
+    if len(data["targets"]) > 1:
+        mark = "✅" if len(selected) == len(data["targets"]) else "⬜"
+        rows.append([InlineKeyboardButton(f"{mark} Select ALL groups", callback_data=make_data("all"))])
+    return rows
+
 
 def _review_rows(batch: str, idx: int, is_image: bool) -> list[list[InlineKeyboardButton]]:
     """Reassess / Regenerate with the same AI (Gemini) or a different one (Groq)."""
@@ -155,37 +157,35 @@ def _review_rows(batch: str, idx: int, is_image: bool) -> list[list[InlineKeyboa
     return rows
 
 
-def _buttons(batch: str, idx: int, is_image: bool = False) -> InlineKeyboardMarkup:
-    """Buttons for one draft of a /generate batch."""
-    rows = [[
-        InlineKeyboardButton("✅ Send to group", callback_data=f"gen_ok|{batch}|{idx}"),
+def _markup(batch: str, data: dict, idx: int) -> InlineKeyboardMarkup:
+    item = data["items"][idx]
+    rows = _group_rows(data, item["selected"], lambda g: f"gen_s|{batch}|{idx}.{g}")
+    rows.append([
+        InlineKeyboardButton(f"📤 Send to selected ({len(item['selected'])})", callback_data=f"gen_ok|{batch}|{idx}"),
         InlineKeyboardButton("🗑 Skip", callback_data=f"gen_no|{batch}|{idx}"),
-    ]]
-    return InlineKeyboardMarkup(rows + _review_rows(batch, idx, is_image))
-
-
-def _send_buttons(batch: str, data: dict) -> InlineKeyboardMarkup:
-    """Buttons for a single draft: one 'Send to <group>' per group (auto drafts, polls/text/images you send)."""
-    rows = []
-    for i, cid in enumerate(data["targets"]):
-        rows.append([InlineKeyboardButton(f"✅ Send to {data['titles'].get(cid, cid)}"[:60],
-                                          callback_data=f"agen|{batch}|{i}")])
-    if len(data["targets"]) > 1:
-        rows.append([InlineKeyboardButton("✅ Send to ALL groups", callback_data=f"agen|{batch}|all")])
-    mcq = data["items"][0]["mcq"]
-    rows += _review_rows(batch, 0, bool(mcq.get("image_file_id")))
-    rows.append([InlineKeyboardButton("🗑 Skip", callback_data=f"gen_no|{batch}|0")])
+    ])
+    rows += _review_rows(batch, idx, bool(item["mcq"].get("image_file_id")))
     return InlineKeyboardMarkup(rows)
 
 
-def _markup(batch: str, data: dict, idx: int) -> InlineKeyboardMarkup:
-    if data.get("flow") == "single":
-        return _send_buttons(batch, data)
-    return _buttons(batch, idx, bool(data["items"][idx]["mcq"].get("image_file_id")))
+def _waiting(data: dict) -> int:
+    return sum(1 for i in data["items"] if i["status"] is None)
+
+
+def _panel_text(data: dict) -> str:
+    return (f"📦 Send several at once: {_waiting(data)} draft(s) waiting.\n"
+            "Tick the groups, then send. Skip any draft you don't want first.")
+
+
+def _panel_markup(batch: str, data: dict) -> InlineKeyboardMarkup:
+    rows = _group_rows(data, data["selected"], lambda g: f"gen_g|{batch}|{g}")
+    rows.append([InlineKeyboardButton(
+        f"📤 Send ALL waiting ({_waiting(data)}) to selected", callback_data=f"gen_all|{batch}|0")])
+    return InlineKeyboardMarkup(rows)
 
 
 # ─────────────────────────────────────────────────────────────
-# Single drafts (shared by /auto and by polls / text / images you send)
+# Delivering drafts (shared by /generate, /auto and anything you send the bot)
 # ─────────────────────────────────────────────────────────────
 
 async def _group_titles(context: ContextTypes.DEFAULT_TYPE, targets: list[int]) -> dict:
@@ -199,45 +199,75 @@ async def _group_titles(context: ContextTypes.DEFAULT_TYPE, targets: list[int]) 
     return {cid: cache[cid] for cid in targets}
 
 
-async def send_single_draft(context: ContextTypes.DEFAULT_TYPE, admin_id: int, mcq: dict, *,
-                            topic: str, level: str | None, header: str,
-                            source: str | None = None, hint: str = "",
-                            avoid: list[str] | None = None, auto: bool = False) -> str:
+def prune_drafts(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Forget finished or day-old batches."""
+    drafts = _drafts(context)
+    now = time.time()
+    for batch in [b for b, d in drafts.items()
+                  if now - d["created"] > DRAFT_TTL_SECONDS or not _waiting(d)]:
+        drafts.pop(batch, None)
+
+
+async def send_drafts(context: ContextTypes.DEFAULT_TYPE, admin_id: int, mcqs: list[dict], *,
+                      topic: str, level: str | None, header: str,
+                      source: str | None = None, hint: str = "",
+                      avoid: list[str] | None = None, auto: bool = False,
+                      source_image_id: str | None = None, pdf_file_id: str | None = None) -> int:
     """
-    DM one draft to the admin with a 'Send to <group>' button per group.
-    Image drafts: the picture is sent first, then the draft text.
-    Raises NoTargetGroups, or the Telegram error if the admin can't be messaged.
+    DM a batch of drafts to the admin. Returns how many were delivered.
+    Raises NoTargetGroups, or the Telegram error if the admin can't be messaged at all.
     """
     targets = _target_chats()
     if not targets:
         raise NoTargetGroups()
     titles = await _group_titles(context, targets)
+    prune_drafts(context)
 
+    only_one = set(targets) if len(targets) == 1 else set()
+    items = [{"mcq": m, "status": None, "msg_id": None, "note": "", "busy": False,
+              "selected": set(only_one), "sent_to": set()} for m in mcqs]
     batch = uuid.uuid4().hex[:6]
     data = {
         "admin": admin_id, "chat_id": admin_id, "topic": topic, "level": level,
         "source": source, "hint": hint, "avoid": list(avoid or []),
-        "items": [{"mcq": mcq, "status": None, "msg_id": None, "img_msg_id": None, "note": "", "busy": False}],
-        "targets": targets, "titles": titles, "selected": set(),
-        "flow": "single", "auto": auto, "created": time.time(), "header": header,
+        "source_image_id": source_image_id, "pdf_file_id": pdf_file_id,
+        "items": items, "targets": targets, "titles": titles,
+        "selected": set(only_one), "panel_msg_id": None,
+        "auto": auto, "created": time.time(), "header": header,
     }
     _drafts(context)[batch] = data
-    item = data["items"][0]
 
-    try:
-        if mcq.get("image_file_id"):
-            try:
-                photo = await context.bot.send_photo(admin_id, mcq["image_file_id"])
-                item["img_msg_id"] = photo.message_id
-            except Exception:
-                logger.exception("Could not show the draft image to the admin")
-        sent = await context.bot.send_message(
-            admin_id, header + _preview_text(0, 1, mcq), reply_markup=_send_buttons(batch, data))
-    except Exception:
-        _drafts(context).pop(batch, None)
-        raise
-    item["msg_id"] = sent.message_id
-    return batch
+    delivered, shown_images = 0, set()
+    for i, item in enumerate(items):
+        image_id = item["mcq"].get("image_file_id")
+        try:
+            if image_id and image_id not in shown_images:
+                try:
+                    await context.bot.send_photo(admin_id, image_id)
+                    shown_images.add(image_id)
+                except Exception:
+                    logger.exception("Could not show the draft image to the admin")
+            sent = await context.bot.send_message(
+                admin_id, header + _preview_text(i, len(items), item["mcq"]),
+                reply_markup=_markup(batch, data, i))
+        except Exception:
+            if not delivered:
+                _drafts(context).pop(batch, None)
+                raise
+            logger.exception("Could not deliver draft %s of %s", i + 1, len(items))
+            item["status"] = "undelivered"
+            continue
+        item["msg_id"] = sent.message_id
+        delivered += 1
+
+    if delivered > 1:
+        try:
+            panel = await context.bot.send_message(
+                admin_id, _panel_text(data), reply_markup=_panel_markup(batch, data))
+            data["panel_msg_id"] = panel.message_id
+        except Exception:
+            logger.exception("Could not send the send-all panel")
+    return delivered
 
 
 # ─────────────────────────────────────────────────────────────
@@ -272,8 +302,7 @@ async def generate_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    targets = _target_chats()
-    if not targets:
+    if not _target_chats():
         await msg.reply_text(
             "No group is set up to receive MCQs yet. Add TARGET_CHAT_IDS "
             "(your group IDs, comma-separated) in the host's environment variables and restart."
@@ -282,7 +311,7 @@ async def generate_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     working = await msg.reply_text(f"🤖 Asking Gemini for {count} MCQs on “{topic}”…")
     try:
-        mcqs, dropped = await generate_mcqs(topic, count)
+        mcqs, _ = await generate_mcqs(topic, count)
     except GeminiError as e:
         await working.edit_text(f"❌ {e}")
         return
@@ -291,39 +320,9 @@ async def generate_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await working.edit_text("❌ Something went wrong while generating. Please try again.")
         return
 
-    batch = uuid.uuid4().hex[:6]
-    items = [{"mcq": m, "status": None, "msg_id": None, "note": "", "busy": False} for m in mcqs]
-    titles = await _group_titles(context, targets)
-    data = {
-        "admin": user.id, "chat_id": msg.chat_id, "topic": topic, "items": items,
-        "targets": targets, "titles": titles,
-        "selected": set(targets) if len(targets) == 1 else set(),
-        "flow": "multi", "level": None, "source": None, "hint": "", "avoid": [],
-        "header": "",
-    }
-    _drafts(context)[batch] = data
-
-    note = f" ({dropped} unusable one(s) were left out)" if dropped else ""
     await working.edit_text(
-        f"✅ {len(mcqs)} draft(s) ready{note}.\n"
-        f"Nothing is posted until you tap “Send to group”."
-    )
-    if len(targets) > 1:
-        await msg.reply_text(_selector_text(data), reply_markup=_selector_markup(batch, data))
-    else:
-        await msg.reply_text(f"📍 Posting will go to: {_title(data, targets[0])}")
-
-    for i, item in enumerate(items):
-        sent = await msg.reply_text(_preview_text(i, len(items), item["mcq"]), reply_markup=_buttons(batch, i))
-        item["msg_id"] = sent.message_id
-
-    if len(items) > 1:
-        await msg.reply_text(
-            "Or approve everything that is still waiting:",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("✅ Send ALL to group", callback_data=f"gen_all|{batch}|0")
-            ]])
-        )
+        f"✅ {len(mcqs)} draft(s) ready.\nNothing is posted until you tap a Send button.")
+    await send_drafts(context, msg.chat_id, mcqs, topic=topic, level=None, header="")
 
 
 # ─────────────────────────────────────────────────────────────
@@ -413,20 +412,51 @@ async def _render(context, data: dict, batch: str, idx: int, extra: str = "", ke
             logger.warning(f"Could not redraw draft: {e}")
 
 
-async def _review_action(q, context, batch: str, data: dict, action: str, idx_raw: str):
-    try:
-        idx = int(idx_raw)
-        item = data["items"][idx]
-    except (ValueError, IndexError):
-        await q.answer()
-        return
-    if item["status"]:
-        await q.answer("Already handled.")
-        return
-    if item.get("busy"):
-        await q.answer("Still working on it…")
-        return
+async def _regenerate(context, data: dict, mcq: dict, provider: str) -> tuple[dict, str]:
+    """A fresh question from the same source (image + caption, PDF, text or topic)."""
+    label = PROVIDER_LABELS[provider]
+    note = f"🔄 New question written by {label}"
+    avoid = [i["mcq"]["question"] for i in data["items"]] + data.get("avoid", [])
+    image_id = mcq.get("image_file_id") or data.get("source_image_id")
 
+    if image_id:
+        image = await download_file(context.bot, image_id)
+        res = (await generate_image_mcqs(
+            image, 1, hint=data.get("hint", ""), level=data.get("level"),
+            avoid=avoid, provider=provider))[0]
+        new = {k: res[k] for k in ("question", "options", "correct", "explanation", "subject", "topic")}
+        if res["uses_image"]:
+            new["image_file_id"] = image_id
+            new["layout"] = pick_layout(new["question"])
+        return new, note
+
+    source, pdf = data.get("source"), None
+    if data.get("pdf_file_id"):
+        raw = await download_file(context.bot, data["pdf_file_id"])
+        if provider == "gemini":
+            pdf = raw
+        else:
+            text = pdf_text(raw)
+            if len(text) >= 200:
+                # a random 4000-character window, so repeats don't always use page 1
+                start = random.randint(0, max(0, len(text) - 4000))
+                source = text[start:start + 4000]
+            else:
+                source = f"{mcq['question']}\n{mcq.get('explanation') or ''}"
+                note += " (it can't read these PDF pages, so it used the same concept)"
+
+    mcqs, _ = await generate_mcqs(
+        data["topic"], 1, level=data.get("level"), avoid=avoid, source=source,
+        provider=provider, pdf=pdf, hint=data.get("hint", ""))
+    new = dict(mcqs[0])
+    for k in ("subject", "topic"):
+        if mcq.get(k):
+            new[k] = mcq[k]
+    return new, note
+
+
+async def _review_action(q, context, batch: str, data: dict, action: str, idx: int):
+    item = data["items"][idx]
     mcq = item["mcq"]
 
     if action == "gen_lay":
@@ -443,18 +473,17 @@ async def _review_action(q, context, batch: str, data: dict, action: str, idx_ra
     is_reassess = action[4] == "v"                       # gen_v? = reassess, gen_r? = regenerate
     provider = "gemini" if action[5] == "g" else "other"
     label = PROVIDER_LABELS[provider]
-    await q.answer(f"{'Reassessing' if is_reassess else 'Regenerating'} with {label}…")
+    doing = "Reassessing" if is_reassess else "Regenerating"
 
     item["busy"] = True
-    await _render(context, data, batch, idx,
-                  extra=f"⏳ {'Reassessing' if is_reassess else 'Regenerating'} with {label}…")
     try:
-        image = None
-        if mcq.get("image_file_id"):
-            image = await download_file(context.bot, mcq["image_file_id"])
-
+        await q.answer(f"{doing} with {label}…")
+        await _render(context, data, batch, idx, extra=f"⏳ {doing} with {label}…")
         if is_reassess:
-            fixed, ai_note = await reassess_mcq(mcq, provider=provider, image=image)
+            image = None
+            if mcq.get("image_file_id"):
+                image = await download_file(context.bot, mcq["image_file_id"])
+            fixed, ai_note = await reassess_mcq(mcq, provider=provider, image=image, hint=data.get("hint", ""))
             new = {**mcq, **fixed}
             if fixed["correct"] != mcq["correct"]:
                 head = f"🔍 {label} re-checked: ⚠️ answer changed {mcq['correct']} → {fixed['correct']}"
@@ -463,26 +492,8 @@ async def _review_action(q, context, batch: str, data: dict, action: str, idx_ra
             else:
                 head = f"🔍 {label} re-checked: ✅ answer looks correct"
             item["note"] = head + (f"\n{ai_note}" if ai_note else "")
-        elif image:
-            res = await generate_image_mcq(
-                image, hint=data.get("hint", ""), level=data.get("level"),
-                avoid=[mcq["question"]] + data.get("avoid", []), provider=provider)
-            new = {k: res[k] for k in ("question", "options", "correct", "explanation", "subject", "topic")}
-            if res["uses_image"]:
-                new["image_file_id"] = mcq["image_file_id"]
-                new["layout"] = pick_layout(new["question"])
-            item["note"] = f"🔄 New question written by {label}"
         else:
-            mcqs, _ = await generate_mcqs(
-                data["topic"], 1, level=data.get("level"),
-                avoid=[mcq["question"]] + data.get("avoid", []),
-                source=data.get("source"), provider=provider)
-            new = dict(mcqs[0])
-            for k in ("subject", "topic"):
-                if mcq.get(k):
-                    new[k] = mcq[k]
-            item["note"] = f"🔄 New question written by {label}"
-
+            new, item["note"] = await _regenerate(context, data, mcq, provider)
         item["mcq"] = new
     except GeminiError as e:
         item["note"] = f"⚠️ {label} could not do that: {e}"
@@ -492,6 +503,63 @@ async def _review_action(q, context, batch: str, data: dict, action: str, idx_ra
     finally:
         item["busy"] = False
     await _render(context, data, batch, idx)
+
+
+async def _send_item(context, data: dict, batch: str, idx: int, chats: list[int], admin_id: int) -> bool:
+    """Post one draft to the chosen groups. True = every chosen group got it."""
+    item = data["items"][idx]
+    todo = [c for c in chats if c not in item["sent_to"]]
+    item["busy"] = True                      # set before any await: blocks double taps
+    try:
+        _, failed = await _post_to_groups(context, item["mcq"], admin_id, todo)
+    finally:
+        item["busy"] = False
+    item["sent_to"] |= {c for c in todo if c not in failed}
+    sent_names = ", ".join(_title(data, c) for c in data["targets"] if c in item["sent_to"])
+
+    if not failed:
+        item["status"] = "sent"
+        await _clear_buttons(context, data["chat_id"], item["msg_id"],
+                             _preview_text(idx, len(data["items"]), item["mcq"]) + f"\n\n✅ Sent to {sent_names}")
+        return True
+
+    # Keep the buttons, with only the failed groups ticked, so a retry never posts twice.
+    item["selected"] = set(failed)
+    extra = f"⚠️ Could not post to: {', '.join(_title(data, c) for c in failed)}. Is the bot allowed to post polls there?"
+    if sent_names:
+        extra = f"✅ Already sent to {sent_names}\n" + extra
+    await _render(context, data, batch, idx, extra=extra)
+    return False
+
+
+async def _update_panel(context, data: dict, batch: str) -> None:
+    if not data.get("panel_msg_id"):
+        return
+    try:
+        if _waiting(data):
+            await context.bot.edit_message_text(
+                chat_id=data["chat_id"], message_id=data["panel_msg_id"],
+                text=_panel_text(data), reply_markup=_panel_markup(batch, data))
+        else:
+            await context.bot.edit_message_text(
+                chat_id=data["chat_id"], message_id=data["panel_msg_id"],
+                text="📦 All drafts in this batch are done.")
+    except Exception as e:
+        if "not modified" not in str(e).lower():
+            logger.warning(f"Could not update the panel: {e}")
+
+
+def _toggle(data: dict, selected: set, which: str) -> bool:
+    if which == "all":
+        if len(selected) == len(data["targets"]):
+            selected.clear()
+        else:
+            selected.update(data["targets"])
+        return True
+    if which.isdigit() and int(which) < len(data["targets"]):
+        selected.symmetric_difference_update({data["targets"][int(which)]})
+        return True
+    return False
 
 
 # ─────────────────────────────────────────────────────────────
@@ -521,92 +589,85 @@ async def generate_callback_handler(update: Update, context: ContextTypes.DEFAUL
         return
 
     items = data["items"]
-    chat_id = data["chat_id"]
     admin_id = q.from_user.id
 
-    if action in ("gen_vg", "gen_vo", "gen_rg", "gen_ro", "gen_lay"):
-        await _review_action(q, context, batch, data, action, idx_raw)
-        return
-
+    # ── Panel: tick groups / send every waiting draft ──
     if action == "gen_g":
-        if idx_raw == "all":
-            if len(data["selected"]) == len(data["targets"]):
-                data["selected"] = set()
-            else:
-                data["selected"] = set(data["targets"])
-        else:
-            try:
-                cid = data["targets"][int(idx_raw)]
-            except (ValueError, IndexError):
-                await q.answer()
-                return
-            data["selected"] ^= {cid}
+        _toggle(data, data["selected"], idx_raw)
         await q.answer()
-        try:
-            await q.edit_message_text(_selector_text(data), reply_markup=_selector_markup(batch, data))
-        except Exception:
-            pass
-        return
-
-    if action in ("gen_ok", "gen_all") and not _selected_chats(data):
-        await q.answer("Choose a group first (tap a group name above).", show_alert=True)
-        return
-
-    if action in ("gen_ok", "gen_no"):
-        try:
-            idx = int(idx_raw)
-            item = items[idx]
-        except (ValueError, IndexError):
-            await q.answer()
-            return
-        if item["status"]:
-            await q.answer("Already handled.")
-            return
-
-        if action == "gen_no":
-            item["status"] = "skipped"
-            await q.answer("Skipped")
-            await _clear_buttons(context, chat_id, item["msg_id"],
-                                 _preview_text(idx, len(items), item["mcq"]) + "\n\n🗑 Skipped")
-            return
-
-        await q.answer("Sending…")
-        ok, failed = await _post_to_groups(context, item["mcq"], admin_id, _selected_chats(data))
-        if ok:
-            item["status"] = "sent"
-            tail = f"\n\n✅ Sent to {ok} group(s)"
-            if failed:
-                tail += f"\n⚠️ Could not post to: {', '.join(map(str, failed))} (is the bot an admin there?)"
-            await _clear_buttons(context, chat_id, item["msg_id"],
-                                 _preview_text(idx, len(items), item["mcq"]) + tail)
-        else:
-            # Leave buttons so the admin can retry after fixing permissions
-            await context.bot.send_message(
-                chat_id, "⚠️ Could not post to any group. Make sure the bot is in the group and allowed to post polls, then tap again.")
+        await _update_panel(context, data, batch)
         return
 
     if action == "gen_all":
-        await q.answer("Sending all…")
-        sent_n, skipped_fail = 0, 0
-        for i, item in enumerate(items):
-            if item["status"]:
-                continue
-            ok, failed = await _post_to_groups(context, item["mcq"], admin_id, _selected_chats(data))
-            if ok:
-                item["status"] = "sent"
-                sent_n += 1
-                await _clear_buttons(context, chat_id, item["msg_id"],
-                                     _preview_text(i, len(items), item["mcq"]) + f"\n\n✅ Sent to {ok} group(s)")
-            else:
-                skipped_fail += 1
+        chats = [c for c in data["targets"] if c in data["selected"]]
+        if not chats:
+            await q.answer("Tick at least one group first.", show_alert=True)
+            return
+        if data.get("sending_all"):
+            await q.answer("Already sending…")
+            return
+        data["sending_all"] = True
+        sent_n, problems = 0, 0
         try:
-            await q.edit_message_reply_markup(reply_markup=None)
-        except Exception:
-            pass
-        summary = f"✅ Sent {sent_n} MCQ(s) to the group(s)."
-        if skipped_fail:
-            summary += f"\n⚠️ {skipped_fail} could not be posted. Check the bot's permissions in the group."
-        await context.bot.send_message(chat_id, summary)
+            await q.answer("Sending all…")
+            for i, item in enumerate(items):
+                if item["status"] or item["busy"]:
+                    continue
+                if await _send_item(context, data, batch, i, chats, admin_id):
+                    sent_n += 1
+                else:
+                    problems += 1
+        finally:
+            data["sending_all"] = False
+        await _update_panel(context, data, batch)
+        summary = f"✅ Sent {sent_n} MCQ(s) to {len(chats)} group(s)."
+        if problems:
+            summary += f"\n⚠️ {problems} draft(s) had a problem. See the note under each one."
+        await context.bot.send_message(data["chat_id"], summary)
+        return
+
+    # ── Buttons under one draft ──
+    which = ""
+    if action == "gen_s":
+        idx_raw, _, which = idx_raw.partition(".")
+    if not idx_raw.isdigit() or int(idx_raw) >= len(items):
+        await q.answer()
+        return
+    idx = int(idx_raw)
+    item = items[idx]
+    if item["status"]:
+        await q.answer("Already handled.")
+        return
+    if item["busy"]:
+        await q.answer("Still working on it…")
+        return
+
+    if action == "gen_s":
+        _toggle(data, item["selected"], which)
+        await q.answer()
+        await _render(context, data, batch, idx)
+        return
+
+    if action == "gen_ok":
+        chats = [c for c in data["targets"] if c in item["selected"]]
+        if not chats:
+            await q.answer("Tick at least one group first.", show_alert=True)
+            return
+        await q.answer("Sending…")
+        await _send_item(context, data, batch, idx, chats, admin_id)
+        await _update_panel(context, data, batch)
+        return
+
+    if action == "gen_no":
+        item["status"] = "skipped"
+        await q.answer("Skipped")
+        await _clear_buttons(context, data["chat_id"], item["msg_id"],
+                             _preview_text(idx, len(items), item["mcq"]) + "\n\n🗑 Skipped")
+        await _update_panel(context, data, batch)
+        return
+
+    if action in ("gen_vg", "gen_vo", "gen_rg", "gen_ro", "gen_lay"):
+        await _review_action(q, context, batch, data, action, idx)
         return
 
     await q.answer()
